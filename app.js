@@ -259,7 +259,8 @@
         pendingPoint: null,
         hoverId: null,
         pointerInside: false,
-        dragBodyId: null
+        dragBodyId: null,
+        dragAtPoint: false
       };
 
       this.camera = { x: -0.1, y: -2.35, zoom: 1 };
@@ -555,11 +556,33 @@
       });
       document.getElementById('btnFit').addEventListener('click', () => this.fitView());
 
+      this.dragPointBtn = document.getElementById('btnDragPoint');
+      if (this.dragPointBtn) {
+        this.dragPointBtn.addEventListener('click', () => {
+          this.state.dragAtPoint = !this.state.dragAtPoint;
+          this.updateDragPointUI();
+          this.toast(this.state.dragAtPoint
+            ? '施力点：鼠标按下的位置（拖动会使物体转动）'
+            : '施力点：重心（拖动不会使物体转动）', 1800);
+        });
+      }
+      this.updateDragPointUI();
+
       document.getElementById('speedGroup').addEventListener('click', (event) => {
         const button = event.target.closest('[data-speed]');
         if (!button) return;
         this.setSpeed(Number(button.dataset.speed));
       });
+    }
+
+    updateDragPointUI() {
+      const button = this.dragPointBtn;
+      if (!button) return;
+      const on = Boolean(this.state.dragAtPoint);
+      button.classList.toggle('is-on', on);
+      button.setAttribute('aria-pressed', on ? 'true' : 'false');
+      const label = button.querySelector('#dragPointText');
+      if (label) label.textContent = on ? '指针' : '重心';
     }
 
     bindPanelEvents() {
@@ -1642,8 +1665,13 @@
 
     getFixedInfo(conn) {
       if (!conn || (conn.type !== 'spring' && conn.type !== 'rod')) return null;
-      if (conn.fixedA && conn.a) return { fixedRef: conn.a, otherRef: conn.b, end: 'a' };
-      if (conn.fixedB && conn.b) return { fixedRef: conn.b, otherRef: conn.a, end: 'b' };
+      const hasA = Boolean(conn.fixedA && conn.a);
+      const hasB = Boolean(conn.fixedB && conn.b);
+      if (hasA && hasB) {
+        return { fixedRef: conn.a, otherRef: conn.b, end: 'a', both: true };
+      }
+      if (hasA) return { fixedRef: conn.a, otherRef: conn.b, end: 'a', both: false };
+      if (hasB) return { fixedRef: conn.b, otherRef: conn.a, end: 'b', both: false };
       return null;
     }
 
@@ -1667,13 +1695,10 @@
 
     setConnectorFixedEnd(conn, end, fixed) {
       if (!conn || (conn.type !== 'spring' && conn.type !== 'rod')) return;
-      if (end === 'b') {
-        conn.fixedB = Boolean(fixed);
-        if (conn.fixedB) conn.fixedA = false;
-      } else {
-        conn.fixedA = Boolean(fixed);
-        if (conn.fixedA) conn.fixedB = false;
-      }
+      // Both ends may be fixed at once: the connector's axis is shared, so the
+      // second end simply pins the same direction at the other endpoint.
+      if (end === 'b') conn.fixedB = Boolean(fixed);
+      else conn.fixedA = Boolean(fixed);
       conn.lockDir = null;
       if (this.getFixedInfo(conn)) this.ensureLockDir(conn, true);
     }
@@ -2465,15 +2490,30 @@
       const body = entity.body;
       const pointer = this.screenToWorld(this.pointer.x, this.pointer.y);
       const target = { x: pointer.x - drag.offset.x, y: pointer.y - drag.offset.y };
-      const dx = target.x - body.position.x;
-      const dy = target.y - body.position.y;
       const velocity = this.bodyVelocity(body);
+
+      // Default: the pull acts on the centre of mass, so dragging never spins the
+      // body up. In "施力点跟随指针" mode the force instead acts on the material
+      // point that was grabbed, which produces torque — exactly like real life.
+      let applyPoint = { x: body.position.x, y: body.position.y };
+      let sampleVx = velocity.x;
+      let sampleVy = velocity.y;
+      if (this.state.dragAtPoint) {
+        applyPoint = this.localToWorld(body, drag.local);
+        const rx = applyPoint.x - body.position.x;
+        const ry = applyPoint.y - body.position.y;
+        const omega = (body.angularVelocity || 0) * 60;
+        sampleVx = velocity.x - omega * ry;
+        sampleVy = velocity.y + omega * rx;
+      }
+      const dx = target.x - applyPoint.x;
+      const dy = target.y - applyPoint.y;
       const mass = Math.max(0.001, entity.mass);
       const gravity = Math.max(1, this.state.gravity);
       const stiffness = Math.max(45, mass * gravity * 14);
       const damping = 2 * Math.sqrt(stiffness * mass) * 0.5;
-      let fx = stiffness * dx - damping * velocity.x;
-      let fy = stiffness * dy - damping * velocity.y;
+      let fx = stiffness * dx - damping * sampleVx;
+      let fy = stiffness * dy - damping * sampleVy;
       const maxForce = Math.max(140, mass * gravity * 16);
       const magnitude = Math.hypot(fx, fy);
       if (magnitude > maxForce) {
@@ -2484,13 +2524,11 @@
         this.endForceDrag();
         return;
       }
-      // The pull acts at the centre of mass, so dragging never spins the body up.
-      const center = { x: body.position.x, y: body.position.y };
       if (Math.hypot(fx, fy) > 0.02) {
-        this.Body.applyForce(body, center, { x: fx * FORCE_UNIT, y: fy * FORCE_UNIT });
+        this.Body.applyForce(body, applyPoint, { x: fx * FORCE_UNIT, y: fy * FORCE_UNIT });
       }
       body._dragForce = { x: fx, y: fy };
-      body._dragPoint = center;
+      body._dragPoint = applyPoint;
     }
 
     localToWorld(body, local) {
@@ -3638,7 +3676,13 @@
           <div class="field-gap"></div>
           ${fields}
           ${fixedControls}
-          ${fixed ? `<div class="notice accent">${fixed.end === 'a' ? '端点 A' : '端点 B'} 已固定方向：连接件不能绕该端点转动，${conn.type === 'rod' ? '另一端保持杆长随动' : '另一端只能沿锁定方向伸缩'}。拖动该端点可重新确定方向。</div>` : ''}
+          ${fixed ? `<div class="notice accent">${
+            fixed.both
+              ? `两端都已固定方向：连接件不能绕任一端转动，只能沿锁定方向${conn.type === 'rod' ? '保持杆长' : '伸缩'}。拖动任一端点可重新确定方向。`
+              : `${fixed.end === 'a' ? '端点 A' : '端点 B'} 已固定方向：连接件不能绕该端点转动，${
+                conn.type === 'rod' ? '另一端保持杆长随动' : '另一端只能沿锁定方向伸缩'
+              }。拖动该端点可重新确定方向。`
+          }</div>` : ''}
           ${conn.type === 'rope' ? '<div class="notice">轻绳只能承受拉力：松弛时没有约束力，拉直后才限制长度。</div>' : ''}
           ${conn.type === 'elastic' ? '<div class="notice">弹性绳只能承受拉力：长度小于原长时没有弹力。</div>' : ''}
           ${conn.type === 'rod' ? '<div class="notice">轻硬杆长度不可改变，既能受拉也能受压。</div>' : ''}
@@ -4258,7 +4302,10 @@
             按住任意未锁定的物体并拖动，就在重心处施加一个外力；松手立即撤销。拖动时模拟继续运行，受力箭头、速度和加速度同步更新。
           </div>
           <div class="notice">
-            外力作用在重心上，因此拖动不会让物体凭空旋转。拖动物体以外的空白处仍然是平移画布。受力箭头按各自的比例尺线性绘制，接触力画在实际接触点上，因此叠放物块之间的压力会单独显示。
+            底部「拖拽 施力点」可切换施力位置：默认<strong>重心</strong>，拖动不会让物体凭空旋转；切到<strong>指针</strong>后，力作用在鼠标按下的那个点上，物体会被拉得转动起来（这是默认关闭的额外模式）。
+          </div>
+          <div class="notice">
+            拖动物体以外的空白处仍然是平移画布。受力箭头按各自的比例尺线性绘制，接触力画在实际接触点上，因此叠放物块之间的压力会单独显示。
           </div>
         </section>
         <section class="panel-section">
@@ -4268,6 +4315,9 @@
           </div>
           <div class="notice">
             添加连接时，依次点击两个端点。端点可以是物块、斜面或锚点；连接件画在物体后面，端点处用实心点标记。
+          </div>
+          <div class="notice">
+            硬杆和弹簧的「固定端点方向」两端各自独立，可以只固定一端，也可以两端都固定；轻绳与弹性绳不提供该选项。
           </div>
           <div class="notice">
             「锁定位置」的物体在模拟中完全不动、速度恒为 0，但仍参与碰撞与受力分析；编辑模式下依然可以拖动。斜面默认锁定。
@@ -4899,7 +4949,9 @@
           if (this.drag.moved && this.forceDrag) {
             this.forceDrag.moved = true;
             if (!this.state.running) this.startSimulation();
-            this.setHint('拖动中：按下的位置施加外力，松开即撤销');
+            this.setHint(this.state.dragAtPoint
+              ? '拖动中：外力作用在按下的位置，物体会随之转动'
+              : '拖动中：外力作用在重心，松开即撤销');
           }
           return;
         }
@@ -5429,19 +5481,26 @@
         const fixed = this.getFixedInfo(conn);
 
         if (fixed) {
-          const fixedPoint = this.getRefPoint(fixed.fixedRef);
-          if (fixedPoint) {
-            const anchor = this.worldToScreen(fixedPoint.x, fixedPoint.y);
-            const dir = this.ensureLockDir(conn) || { x: 0, y: 1 };
+          const dir = this.ensureLockDir(conn) || { x: 0, y: 1 };
+          const drawFixedAxis = (worldPoint) => {
+            const anchor = this.worldToScreen(worldPoint.x, worldPoint.y);
             ctx.save();
             ctx.setLineDash([3, 5]);
             ctx.strokeStyle = selected ? 'rgba(114,183,255,0.5)' : 'rgba(255,255,255,0.16)';
             ctx.lineWidth = 1;
             ctx.beginPath();
-            ctx.moveTo(anchor.x - dir.x * 22, anchor.y - dir.y * 22);
-            ctx.lineTo(anchor.x + dir.x * 22, anchor.y + dir.y * 22);
+            ctx.moveTo(anchor.x - dir.x * 20, anchor.y - dir.y * 20);
+            ctx.lineTo(anchor.x + dir.x * 20, anchor.y + dir.y * 20);
             ctx.stroke();
             ctx.restore();
+            ctx.fillStyle = selected ? '#72b7ff' : 'rgba(255,255,255,0.55)';
+            ctx.fillRect(anchor.x - 1.8, anchor.y - 1.8, 3.6, 3.6);
+          };
+          const fixedPoint = this.getRefPoint(fixed.fixedRef);
+          if (fixedPoint) drawFixedAxis(fixedPoint);
+          if (fixed.both) {
+            const otherPoint = this.getRefPoint(fixed.end === 'a' ? conn.b : conn.a);
+            if (otherPoint) drawFixedAxis(otherPoint);
           }
         }
 

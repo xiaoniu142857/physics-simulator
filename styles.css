@@ -1538,6 +1538,45 @@ kbd {
   color: #8f8f8f;
 }
 
+.shortcut-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 7px;
+  border: 1px solid #1e1e1e;
+  background: #0b0b0b;
+  color: #6f6f6f;
+  font-family: var(--mono);
+  font-size: 9px;
+  white-space: nowrap;
+  cursor: pointer;
+  border-radius: 0;
+}
+
+.shortcut-btn:hover {
+  border-color: #3a3a3a;
+  color: #b9b9b9;
+}
+
+.shortcut-btn kbd {
+  color: #8f8f8f;
+}
+
+.shortcut-btn b {
+  font-weight: 500;
+  color: #d8d8d8;
+}
+
+.shortcut-btn.is-on {
+  border-color: #4a4a4a;
+  background: #161616;
+  color: #e8e8e8;
+}
+
+.shortcut-btn.is-on b {
+  color: #ffab5e;
+}
+
 /* --------------------------------------------------------------------------
    Locking, legend scale and charts
    -------------------------------------------------------------------------- */

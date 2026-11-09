@@ -89,7 +89,10 @@
 
       <div class="transport-right">
         <span class="shortcut"><kbd>空格</kbd> 暂停/继续</span>
-        <span class="shortcut"><kbd>拖拽</kbd> 施加外力</span>
+        <button type="button" class="shortcut-btn" id="btnDragPoint" aria-pressed="false"
+          title="切换拖拽时的施力点：重心 / 鼠标按下的位置">
+          <kbd>拖拽</kbd> 施力点 <b id="dragPointText">重心</b>
+        </button>
         <span class="shortcut"><kbd>Del</kbd> 删除</span>
       </div>
     </footer>
