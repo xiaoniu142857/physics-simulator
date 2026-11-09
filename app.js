@@ -287,6 +287,12 @@
       this.history = new Map();
       this.historyTick = 0;
       this.chartTimer = 0;
+      this.forceUiTimer = 0;
+      this.forceFrame = 0;
+      this.liveNodes = new Map();
+      this.forceTable = null;
+      this.forceRows = null;
+      this.forceRowKey = '';
       this.scales = {};
       this.scaleHold = {};
       this.scaleRef = {};
@@ -1581,6 +1587,7 @@
     setEntityLocked(entity, locked) {
       if (!entity || entity.kind === 'anchor') return;
       entity.locked = Boolean(locked);
+      this.forceFrame += 1;
       if (entity.locked && this.state.dragBodyId === entity.id) this.endForceDrag();
       this.applyEntityLock(entity);
       this.history.delete(entity.id);
@@ -2417,7 +2424,14 @@
       if (now - this.chartTimer > 90) {
         this.chartTimer = now;
         this.drawCharts();
+      }
+
+      // The free-body panel follows the simulation at ~30 Hz: fast enough to look
+      // live, cheap enough to leave the canvas at 60 fps.
+      if (this.state.openPanel === 'forces' && now - this.forceUiTimer > 33) {
+        this.forceUiTimer = now;
         this.drawForceDiagram();
+        this.updateForceTable();
       }
 
       this.raf = requestAnimationFrame(this._frame);
@@ -2512,6 +2526,7 @@
       };
       this.state.dragBodyId = entity.id;
       body._dragForce = { x: 0, y: 0 };
+      this.forceFrame += 1;
       return true;
     }
 
@@ -2526,6 +2541,7 @@
       }
       this.forceDrag = null;
       this.state.dragBodyId = null;
+      this.forceFrame += 1;
       this.canvas.classList.remove('is-pulling');
       if (this.hintEl && this.hintEl.textContent.startsWith('拖动中')) this.setHint('');
     }
@@ -3159,6 +3175,11 @@
           html = this.renderObjectsPanel();
       }
       this.panelBody.innerHTML = html;
+      // Nodes were replaced: drop every cached reference into the panel.
+      this.liveNodes = new Map();
+      this.forceTable = null;
+      this.forceRows = null;
+      this.forceRowKey = '';
       this.bindRenderedControls();
       if (preserveScroll) {
         this.panelBody.scrollTop = scroll;
@@ -3740,9 +3761,6 @@
         <section class="panel-section">
           <h3 class="section-title">分析对象 <span class="section-count">${bodies.length} BODIES</span></h3>
           ${bodies.length ? `<div class="chip-row">${chips}</div>` : '<div class="empty-state">场景中没有可分析的物体。</div>'}
-          <div class="status-line">
-            <span>运动状态</span><strong data-live="chart-state">—</strong>
-          </div>
           <div class="section-copy">
             每 1/60 秒采样一次，按水平 x（向右为正）与竖直 y（向上为正）两个分量分别记录，曲线窗口为最近 10 秒。
           </div>
@@ -3847,13 +3865,19 @@
 
     updateForceTable() {
       if (this.state.openPanel !== 'forces') return;
-      const node = this.panelBody.querySelector('[data-force-table]');
+      if (!this.forceTable || !this.forceTable.isConnected) {
+        this.forceTable = this.panelBody.querySelector('[data-force-table]');
+        this.forceRows = null;
+        this.forceRowKey = '';
+      }
+      const node = this.forceTable;
       if (!node) return;
       const entity = this.forceEntity();
       if (!entity) {
         if (node.innerHTML !== '') node.innerHTML = '';
+        this.forceRowKey = '';
+        this.forceRows = null;
         this.setLive('force-net', '—');
-        this.setLive('fbd-scale', '—');
         return;
       }
       const list = this.analyzeForces(entity)
@@ -3869,20 +3893,57 @@
       }), { x: 0, y: 0 });
       const netMag = Math.hypot(net.x, net.y);
 
-      const rows = list.map((item) => `
-        <div class="force-row">
-          <span class="force-name">${item.label}</span>
-          <span class="force-mag">${formatForce(item.mag)} N</span>
-          <span class="force-dir">${this.directionLabel(item.pv)}</span>
-          <span class="force-comp">Fx ${formatSigned(item.pv.x)}　Fy ${formatSigned(item.pv.y)}</span>
-        </div>
-      `).join('');
+      const key = list.map((item) => item.label).join('|');
+      this.ensureForceRows(node, list.length);
+      const rows = this.forceRows || [];
+      for (let i = 0; i < list.length; i += 1) {
+        const item = list[i];
+        const row = rows[i];
+        if (!row) continue;
+        if (row.name.textContent !== item.label) row.name.textContent = item.label;
+        const magText = `${formatForce(item.mag)} N`;
+        if (row.mag.textContent !== magText) row.mag.textContent = magText;
+        const dirText = this.directionLabel(item.pv);
+        if (row.dir.textContent !== dirText) row.dir.textContent = dirText;
+        const compText = `Fx ${formatSigned(item.pv.x)}　Fy ${formatSigned(item.pv.y)}`;
+        if (row.comp.textContent !== compText) row.comp.textContent = compText;
+      }
+      this.forceRowKey = key;
 
-      const html = rows || '<div class="empty-state">该物体当前不受力。</div>';
-      if (node.innerHTML !== html) node.innerHTML = html;
       this.setLive('force-net',
         `${formatForce(netMag)} <small>N</small>　` +
         `(Fx ${formatSigned(net.x)} · Fy ${formatSigned(net.y)})`);
+    }
+
+    /* Reuse the row elements: only grow/shrink the list, never rebuild it. */
+    ensureForceRows(node, count) {
+      if (!this.forceRows) this.forceRows = [];
+      const rows = this.forceRows;
+      const empty = node.querySelector('.empty-state');
+      if (count === 0) {
+        for (const row of rows) row.row.remove();
+        rows.length = 0;
+        if (!empty) node.innerHTML = '<div class="empty-state">该物体当前不受力。</div>';
+        return;
+      }
+      if (empty) empty.remove();
+      while (rows.length < count) {
+        const row = document.createElement('div');
+        row.className = 'force-row';
+        row.innerHTML = '<span class="force-name"></span><span class="force-mag"></span>'
+          + '<span class="force-dir"></span><span class="force-comp"></span>';
+        node.appendChild(row);
+        rows.push({
+          row,
+          name: row.children[0],
+          mag: row.children[1],
+          dir: row.children[2],
+          comp: row.children[3]
+        });
+      }
+      while (rows.length > count) {
+        rows.pop().row.remove();
+      }
     }
 
     drawForceDiagram() {
@@ -3927,6 +3988,7 @@
         fbd.textBaseline = 'middle';
         fbd.fillText('场景中没有物体', cx, cy);
         this.forceDiagramScale = 0;
+        this.setLive('fbd-scale', '—');
         return;
       }
 
@@ -4210,6 +4272,9 @@
           <div class="notice">
             「锁定位置」的物体在模拟中完全不动、速度恒为 0，但仍参与碰撞与受力分析；编辑模式下依然可以拖动。斜面默认锁定。
           </div>
+          <div class="notice">
+            物体左上角的锁图标可直接点击：亮色为已锁定，暗色为未锁定，点击即可切换。
+          </div>
         </section>
         <section class="panel-section">
           <h3 class="section-title">曲线分析</h3>
@@ -4475,6 +4540,7 @@
     }
 
     afterGeometryChange(entity) {
+      this.forceFrame += 1;
       for (const conn of this.getAttachedConnectors(entity.id)) {
         this.syncConnectorConstraint(conn);
       }
@@ -4659,8 +4725,13 @@
     }
 
     setLive(key, html) {
-      const node = this.panelBody.querySelector(`[data-live="${key}"]`);
-      if (node) node.innerHTML = html;
+      if (!this.liveNodes) this.liveNodes = new Map();
+      let node = this.liveNodes.get(key);
+      if (!node || !node.isConnected) {
+        node = this.panelBody.querySelector(`[data-live="${key}"]`);
+        this.liveNodes.set(key, node || null);
+      }
+      if (node && node.innerHTML !== html) node.innerHTML = html;
     }
 
     updateChartReadouts() {
@@ -4679,69 +4750,6 @@
       this.setLive('chart-vy', read('vy', 'm/s'));
       this.setLive('chart-ax', read('ax', 'm/s²'));
       this.setLive('chart-ay', read('ay', 'm/s²'));
-      const motion = this.motionSummary(entry);
-      this.setLive('chart-state', motion.detail ? `${motion.label} · ${motion.detail}` : motion.label);
-    }
-
-    /* Coarse classification of the last 1.5 s of motion. */
-    motionSummary(entry) {
-      if (!entry || entry.t.length < 6) return { label: '等待数据', detail: '' };
-      const n = entry.t.length;
-      const cutoff = entry.t[n - 1] - 1.5;
-      let start = 0;
-      while (start < n && entry.t[start] < cutoff) start += 1;
-      const speeds = entry.v.slice(start);
-      const accels = entry.a.slice(start);
-      if (!speeds.length) return { label: '等待数据', detail: '' };
-      let maxV = 0;
-      let maxA = 0;
-      let sumA = 0;
-      for (let i = 0; i < speeds.length; i += 1) {
-        maxV = Math.max(maxV, speeds[i]);
-        maxA = Math.max(maxA, accels[i]);
-        sumA += accels[i];
-      }
-      const avgA = sumA / accels.length;
-      let variance = 0;
-      for (const value of accels) variance += (value - avgA) ** 2;
-      const deviation = Math.sqrt(variance / accels.length);
-
-      // Does the velocity direction stay on one line, reverse, or turn?
-      // A curved path has acceleration with a component perpendicular to the
-      // velocity (centripetal), which a straight-line motion never has.
-      let minDot = 1;
-      let bendSum = 0;
-      let bendCount = 0;
-      let previous = null;
-      for (let i = start; i < n; i += 1) {
-        const speed = entry.v[i];
-        const accel = entry.a[i];
-        if (speed > 0.15 && accel > 0.15) {
-          const vx = entry.vx[i] / speed;
-          const vy = entry.vy[i] / speed;
-          const ax = entry.ax[i] / accel;
-          const ay = entry.ay[i] / accel;
-          bendSum += Math.abs(vx * ay - vy * ax);
-          bendCount += 1;
-        }
-        if (!(speed > 0.06)) continue;
-        const ux = entry.vx[i] / speed;
-        const uy = entry.vy[i] / speed;
-        if (previous) minDot = Math.min(minDot, ux * previous.x + uy * previous.y);
-        previous = { x: ux, y: uy };
-      }
-      const bend = bendCount ? bendSum / bendCount : 0;
-
-      if (bend > 0.34) {
-        return { label: '曲线运动', detail: `v ≈ ${formatNumber(maxV)} m/s` };
-      }
-      if (maxA < 0.05 && maxV < 0.03) return { label: '静止或受力平衡', detail: '合力 ≈ 0' };
-      if (maxA < 0.05) return { label: '匀速直线运动', detail: `v ≈ ${formatNumber(maxV)} m/s` };
-      if (minDot < 0.94) return { label: '往复直线运动', detail: `v 最大 ${formatNumber(maxV)} m/s` };
-      if (deviation < Math.max(0.12, Math.abs(avgA) * 0.25)) {
-        return { label: '匀变速直线运动', detail: `a ≈ ${formatNumber(avgA)} m/s²` };
-      }
-      return { label: '变加速直线运动', detail: `a 最大 ${formatNumber(maxA)} m/s²` };
     }
 
     /* ======================================================================
@@ -4763,6 +4771,7 @@
           this.canvas.classList.remove('is-movable');
           this.canvas.classList.remove('is-panning');
           this.canvas.classList.remove('is-pullable');
+          this.canvas.classList.remove('is-lockable');
         }
       });
       this.canvas.addEventListener('wheel', (event) => {
@@ -4802,6 +4811,16 @@
 
       const hit = this.hitTest(p.x, p.y);
       this.pointer.down = true;
+
+      if (hit && hit.type === 'lock') {
+        const entity = this.entities.get(hit.id);
+        if (entity) {
+          this.setEntityLocked(entity, !entity.locked);
+          this.toast(entity.locked ? `${entity.name} 已锁定` : `${entity.name} 已解锁`, 1400);
+        }
+        this.pointer.down = false;
+        return;
+      }
 
       if (this.state.mode === 'physics' && hit && hit.type === 'body') {
         const entity = this.entities.get(hit.id);
@@ -4935,6 +4954,7 @@
       );
       this.hoverId = preferHost ? hostHit.id : (hit ? hit.id : null);
       this.canvas.classList.remove('is-pullable');
+      this.canvas.classList.toggle('is-lockable', Boolean(hit && hit.type === 'lock'));
       if (this.state.mode === 'edit' && hit && (hit.type === 'anchor' || hit.type === 'body' || hit.type === 'point')) {
         this.canvas.classList.add('is-movable');
       } else {
@@ -5024,6 +5044,17 @@
         }
       }
 
+      // The lock badge sits just outside the body, so test it before the shape.
+      if (!forConnectorPick && !this.state.pendingPoint) {
+        for (const entity of entities) {
+          const badge = entity._lockBadge;
+          if (!badge) continue;
+          if (Math.abs(badge.x - screenX) <= 8 && Math.abs(badge.y - screenY) <= 8) {
+            return { type: 'lock', id: entity.id, entity };
+          }
+        }
+      }
+
       for (const entity of entities) {
         if (entity.kind === 'anchor' || entity.kind === 'point' || !entity.body) continue;
         const polygon = entity.body.vertices.map((v) => this.worldToScreen(v.x, v.y));
@@ -5105,6 +5136,7 @@
        ====================================================================== */
 
     render(now) {
+      this.forceFrame += 1;
       const ctx = this.ctx;
       ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
       ctx.clearRect(0, 0, this.width, this.height);
@@ -5466,30 +5498,10 @@
         ctx.fillStyle = selected ? '#171717' : hovered ? '#141414' : '#0e0e0e';
         ctx.fill();
 
-        if (entity.kind === 'incline') {
-          ctx.save();
-          ctx.clip();
-          ctx.strokeStyle = 'rgba(255,255,255,0.035)';
-          ctx.lineWidth = 1;
-          const minX = Math.min(...polygon.map((p) => p.x));
-          const maxX = Math.max(...polygon.map((p) => p.x));
-          const minY = Math.min(...polygon.map((p) => p.y));
-          const maxY = Math.max(...polygon.map((p) => p.y));
-          for (let x = minX - (maxY - minY); x < maxX + (maxY - minY); x += 12) {
-            ctx.beginPath();
-            ctx.moveTo(x, maxY);
-            ctx.lineTo(x + (maxY - minY), minY);
-            ctx.stroke();
-          }
-          ctx.restore();
-          tracePolygon();
-        }
-
         ctx.strokeStyle = selected ? '#72b7ff' : hovered ? '#ababab' : '#c7c7c7';
         ctx.lineWidth = selected ? 2 : 1.35;
         ctx.stroke();
 
-        let badge = null;
         if (entity.locked) {
           ctx.save();
           ctx.setLineDash([5, 4]);
@@ -5497,18 +5509,25 @@
           ctx.lineWidth = 1;
           ctx.stroke();
           ctx.restore();
+        }
+
+        let badge = null;
+        {
           const minY = Math.min(...polygon.map((p) => p.y));
           const topVertex = polygon.reduce((best, p) => (p.y < best.y - 0.5 || (Math.abs(p.y - best.y) < 0.5 && p.x < best.x) ? p : best), polygon[0]);
           badge = { x: topVertex.x + 10, y: minY - 9 };
-          this.drawLockBadge(badge.x, badge.y);
-          ctx.font = '8px "Cascadia Mono", Consolas, monospace';
-          ctx.textAlign = 'left';
-          ctx.textBaseline = 'middle';
-          const label = '锁定';
-          ctx.fillStyle = 'rgba(0,0,0,0.85)';
-          ctx.fillRect(badge.x + 9, badge.y - 6, ctx.measureText(label).width + 4, 12);
-          ctx.fillStyle = '#b9b9b9';
-          ctx.fillText(label, badge.x + 11, badge.y);
+          entity._lockBadge = badge;
+          this.drawLockBadge(badge.x, badge.y, Boolean(entity.locked));
+          if (entity.locked) {
+            ctx.font = '8px "Cascadia Mono", Consolas, monospace';
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'middle';
+            const label = '锁定';
+            ctx.fillStyle = 'rgba(0,0,0,0.85)';
+            ctx.fillRect(badge.x + 9, badge.y - 6, ctx.measureText(label).width + 4, 12);
+            ctx.fillStyle = '#b9b9b9';
+            ctx.fillText(label, badge.x + 11, badge.y);
+          }
         }
 
         if (selected) {
@@ -5519,18 +5538,23 @@
         const center = this.worldToScreen(body.position.x, body.position.y);
         const minX = Math.min(...polygon.map((p) => p.x));
         const maxX = Math.max(...polygon.map((p) => p.x));
-        const widthPx = Math.max(1, maxX - minX);
+        // Font size must not depend on the rotated bounding box, otherwise it
+        // changes while the body spins. Use the body's own smaller side.
+        const intrinsic = entity.kind === 'block'
+          ? Math.min(entity.width || 0.1, entity.height || 0.1)
+          : Math.min(entity.base || 0.1, entity.height || 0.1);
+        const sizePx = intrinsic * PPU * this.camera.zoom;
         entity._labelBox = {
           left: minX + 5,
           top: Math.min(...polygon.map((p) => p.y)) + 4,
-          width: widthPx - 10,
-          fontSize: widthPx < 44 ? 8 : widthPx < 65 ? 9 : 10
+          width: Math.max(1, maxX - minX - 10),
+          fontSize: sizePx < 44 ? 8 : sizePx < 65 ? 9 : 10
         };
         entity._center = center;
       }
     }
 
-    /* Mass labels are drawn after the vectors so they stay readable. */
+    /* Entity names are drawn after the vectors so they stay readable. */
     drawEntityLabels() {
       const ctx = this.ctx;
       for (const entity of this.entities.values()) {
@@ -5538,7 +5562,7 @@
         const selected = this.state.selectedId === entity.id;
         const center = entity._center;
         const fontSize = entity._labelBox.fontSize;
-        const text = formatMass(entity.mass);
+        const text = entity.name;
         const sub = selected
           ? (entity.kind === 'block'
             ? `${entity.width.toFixed(2)} × ${entity.height.toFixed(2)} m`
@@ -5564,19 +5588,26 @@
       }
     }
 
-    drawLockBadge(x, y) {
+    drawLockBadge(x, y, locked = true) {
       const ctx = this.ctx;
       ctx.save();
       ctx.setLineDash([]);
-      ctx.fillStyle = 'rgba(0,0,0,0.92)';
+      ctx.fillStyle = locked ? 'rgba(0,0,0,0.92)' : 'rgba(0,0,0,0.5)';
       ctx.fillRect(x - 7, y - 7, 14, 14);
-      ctx.strokeStyle = '#f2f2f2';
-      ctx.lineWidth = 1.2;
+      ctx.strokeStyle = locked ? '#f2f2f2' : 'rgba(255,255,255,0.3)';
+      ctx.lineWidth = 1.1;
       ctx.strokeRect(x - 7, y - 7, 14, 14);
-      ctx.fillStyle = '#f2f2f2';
-      ctx.fillRect(x - 3, y - 1, 6, 5);
+      ctx.fillStyle = locked ? '#f2f2f2' : 'rgba(255,255,255,0.45)';
+      ctx.fillRect(x - 3, y - 0.5, 6, 5);
+      ctx.strokeStyle = locked ? '#f2f2f2' : 'rgba(255,255,255,0.45)';
+      ctx.lineWidth = 1.1;
       ctx.beginPath();
-      ctx.arc(x, y - 1.5, 2.4, Math.PI, Math.PI * 2);
+      if (locked) {
+        ctx.arc(x, y - 1, 2.4, Math.PI, Math.PI * 2);
+      } else {
+        // open shackle: the right leg is lifted, so it reads as "unlocked"
+        ctx.arc(x + 1.1, y - 1, 2.4, Math.PI, Math.PI * 1.85);
+      }
       ctx.stroke();
       ctx.restore();
     }
@@ -5742,6 +5773,8 @@
     analyzeForces(entity) {
       const body = entity.body;
       if (!body) return [];
+      const cached = entity._forcesCache;
+      if (cached && cached.frame === this.forceFrame) return cached.list;
       const list = [];
       const weight = entity.mass * this.state.gravity;
       if (weight > 0.0005) {
@@ -5831,6 +5864,7 @@
         }
       }
 
+      entity._forcesCache = { frame: this.forceFrame, list };
       return list;
     }
 
@@ -5904,7 +5938,7 @@
       const ctx = this.ctx;
       const center = entity._center;
       const fontSize = entity._labelBox.fontSize;
-      const text = formatMass(entity.mass);
+      const text = entity.name;
       const selected = this.state.selectedId === entity.id;
       const sub = selected
         ? (entity.kind === 'block'

@@ -110,6 +110,10 @@ input:focus-visible {
   cursor: grab;
 }
 
+#scene.is-lockable {
+  cursor: pointer;
+}
+
 #scene.is-pulling {
   cursor: grabbing;
 }
