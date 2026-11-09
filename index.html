@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#000000" />
+  <title>力学实验室 · Mechanics Lab</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <div id="workspace">
+      <section id="stage" aria-label="物理画布">
+        <canvas id="scene"></canvas>
+
+        <div class="boot-loading" id="bootLoading">
+          <span class="boot-loading-mark"></span>
+          <span>正在载入物理引擎</span>
+        </div>
+
+        <div class="stage-top">
+          <div class="mode-switch" role="group" aria-label="操作模式">
+            <button type="button" class="mode-btn is-active" data-mode="physics">
+              <span class="mode-dot"></span>物理模式
+            </button>
+            <button type="button" class="mode-btn" data-mode="edit">编辑模式</button>
+          </div>
+          <div class="run-state" id="runState"><span class="run-dot"></span><span id="runStateText">已暂停</span></div>
+        </div>
+
+        <div class="stage-bottom">
+          <div class="vector-legend" id="vectorLegend">
+            <span class="legend-item force"><i></i>受力</span>
+            <span class="legend-item velocity"><i></i>速度</span>
+            <span class="legend-item acceleration"><i></i>加速度</span>
+            <span class="legend-scale" id="legendScale"></span>
+          </div>
+          <div class="view-tools">
+            <button type="button" class="icon-btn" id="btnZoomOut" title="缩小 (滚轮)">−</button>
+            <span class="zoom-readout" id="zoomReadout">100%</span>
+            <button type="button" class="icon-btn" id="btnZoomIn" title="放大 (滚轮)">＋</button>
+            <button type="button" class="icon-btn fit-btn" id="btnFit" title="重置视图">适应</button>
+          </div>
+        </div>
+
+        <div class="scale-bar" id="scaleBar"><span></span><b>1 m</b></div>
+        <div class="interaction-hint" id="interactionHint"></div>
+        <div class="toast" id="toast" role="status" aria-live="polite"></div>
+        <div class="boot-error" id="bootError" hidden>
+          <div class="boot-error-card">
+            <h2>无法载入 Matter.js</h2>
+            <p>本页面需要联网从 CDN 加载物理引擎。请检查网络后刷新页面。</p>
+            <button type="button" onclick="location.reload()">重新载入</button>
+          </div>
+        </div>
+      </section>
+
+      <aside id="side">
+        <div id="panelShell" class="panel-shell is-open">
+          <div id="panelBody" class="panel-body"></div>
+        </div>
+        <nav id="toolbar" class="toolbar" aria-label="工具栏"></nav>
+      </aside>
+    </div>
+
+    <footer id="transport">
+      <div class="transport-left">
+        <button type="button" class="play-btn" id="btnPlay" title="暂停 / 继续 (空格)">
+          <span class="play-icon"></span>
+          <span id="playText">开始</span>
+        </button>
+        <button type="button" class="transport-btn" id="btnStep" title="单步前进">单步</button>
+        <button type="button" class="transport-btn" id="btnReset" title="重置到初始位置">重置</button>
+        <div class="time-readout">
+          <span class="time-label">仿真时间</span>
+          <strong id="timeReadout">0.00 <small>s</small></strong>
+        </div>
+      </div>
+
+      <div class="transport-center">
+        <span class="speed-label">倍速</span>
+        <div class="speed-group" id="speedGroup" role="group" aria-label="播放倍速">
+          <button type="button" data-speed="0.25">0.25×</button>
+          <button type="button" data-speed="0.5">0.5×</button>
+          <button type="button" data-speed="1" class="is-active">1×</button>
+          <button type="button" data-speed="2">2×</button>
+        </div>
+      </div>
+
+      <div class="transport-right">
+        <span class="shortcut"><kbd>空格</kbd> 暂停/继续</span>
+        <span class="shortcut"><kbd>拖拽</kbd> 施加外力</span>
+        <span class="shortcut"><kbd>Del</kbd> 删除</span>
+      </div>
+    </footer>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/matter-js@0.20.0/build/matter.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
