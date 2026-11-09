@@ -15,6 +15,8 @@
   const FIXED_DT = 1 / 360;              // seconds
   const FORCE_UNIT = 1e-6;               // N -> Matter force units
   const BODY_SLOP = 0.003;               // metres
+  const POINT_PROXY_MASS = 0.001;        // 轻量代理体（不作为受力分析对象）
+  const SPLIT_POINT_MASS = 0.5;          // 绳/簧中继结点或滑点：用等效质量让约束能传给两端物体
   const VECTOR = {
     force: '#ff8a24',
     velocity: '#56e07b',
@@ -171,6 +173,8 @@
     elastic: svg('<path d="M2.5 12h2.2c1.7-5.5 3.3-5.5 5 0s3.3 5.5 5 0 3.3-5.5 5 0h2.3"/>'),
     rod: svg('<path d="M3 17 21 7"/><path d="M3 13.8 6.2 20.2M17.8 3.8 21 10.2"/>'),
     rope: svg('<path d="M2.5 9c3.8 0 3.8 6 7.5 6s3.7-6 7.5-6h4"/>'),
+    dynamicPoint: svg('<path d="M12 3.5 20.5 12 12 20.5 3.5 12 12 3.5Z"/><circle cx="12" cy="12" r="2.2" fill="currentColor" stroke="none"/>'),
+    sliderPoint: svg('<path d="M3 18h18"/><circle cx="12" cy="13" r="3.6"/><path d="M8.4 13h7.2M12 9.4v7.2"/>'),
     trash: svg('<path d="M4 7h16M9 7V4h6v3M6.5 7l1 14h9l1-14M10 11v6M14 11v6"/>'),
     close: svg('<path d="M5 5l14 14M19 5 5 19"/>'),
     play: svg('<path d="M7 4.5v15L19 12 7 4.5Z"/>'),
@@ -252,6 +256,7 @@
         selectedId: null,
         openPanel: 'objects',
         pendingConnector: null,
+        pendingPoint: null,
         hoverId: null,
         pointerInside: false,
         dragBodyId: null
@@ -264,7 +269,10 @@
 
       this.entities = new Map();       // blocks, inclines, anchors
       this.connectors = new Map();     // springs, elastic ropes, rods, ropes
-      this.counters = { block: 0, incline: 0, anchor: 0, spring: 0, elastic: 0, rod: 0, rope: 0 };
+      this.counters = {
+        block: 0, incline: 0, anchor: 0, spring: 0, elastic: 0, rod: 0, rope: 0,
+        dynamic: 0, slider: 0
+      };
       this.activeField = null;
       this.lastTime = 0;
       this.accumulator = 0;
@@ -587,7 +595,9 @@
         return;
       }
       if (event.key === 'Escape') {
-        if (this.state.pendingConnector) {
+        if (this.state.pendingPoint) {
+          this.cancelPointPlacement();
+        } else if (this.state.pendingConnector) {
           this.cancelConnectorPick();
         } else {
           this.select(null, { openPanel: false });
@@ -632,7 +642,7 @@
         button.classList.toggle('is-active', button.dataset.mode === this.state.mode);
       });
       this.canvas.classList.toggle('is-edit', this.state.mode === 'edit');
-      this.canvas.classList.toggle('is-picking', Boolean(this.state.pendingConnector));
+      this.canvas.classList.toggle('is-picking', Boolean(this.state.pendingConnector || this.state.pendingPoint));
       this.updateTransportUI();
     }
 
@@ -699,6 +709,9 @@
           entity.x = entity.home.x;
           entity.y = entity.home.y;
           if (entity.proxy) this.Body.setPosition(entity.proxy, { x: entity.x, y: entity.y });
+        } else if (entity.kind === 'point' && entity.proxy) {
+          if (entity.home) this.Body.setPosition(entity.proxy, { x: entity.home.x, y: entity.home.y });
+          if (entity.proxy) this.Body.setVelocity(entity.proxy, { x: 0, y: 0 });
         } else if (entity.body && entity.home) {
           this.Body.setPosition(entity.body, { x: entity.home.x, y: entity.home.y });
           this.Body.setAngle(entity.body, entity.home.angle || 0);
@@ -725,7 +738,7 @@
       this.playText.textContent = running ? '暂停' : (this.state.simTime > 0 ? '继续' : '开始');
       this.runStateEl.classList.toggle('is-running', running);
       this.runStateText.textContent = running ? '运行中' : '已暂停';
-      this.canvas.classList.toggle('is-picking', Boolean(this.state.pendingConnector));
+      this.canvas.classList.toggle('is-picking', Boolean(this.state.pendingConnector || this.state.pendingPoint));
       if (this.timeReadout) {
         this.timeReadout.innerHTML = `${this.state.simTime.toFixed(2)} <small>s</small>`;
       }
@@ -773,7 +786,8 @@
       this.counters[type] = (this.counters[type] || 0) + 1;
       const labels = {
         block: '物块', incline: '斜面', anchor: '锚点',
-        spring: '轻弹簧', elastic: '轻弹性绳', rod: '轻硬杆', rope: '轻绳'
+        spring: '轻弹簧', elastic: '轻弹性绳', rod: '轻硬杆', rope: '轻绳',
+        dynamic: '动点', slider: '滑点'
       };
       return `${labels[type]} ${this.counters[type]}`;
     }
@@ -924,7 +938,6 @@
         name: spec.name || this.nextName('anchor'),
         x: Number.isFinite(Number(spec.x)) ? Number(spec.x) : this.camera.x,
         y: Number.isFinite(Number(spec.y)) ? Number(spec.y) : this.camera.y,
-        fixedDirection: Boolean(spec.fixedDirection),
         proxy: null,
         home: null
       };
@@ -953,10 +966,7 @@
       entity.x = x;
       entity.y = y;
       if (entity.proxy) this.Body.setPosition(entity.proxy, { x, y });
-      for (const conn of this.getAttachedConnectors(entity.id)) {
-        const fixed = this.getFixedAnchorInfo(conn);
-        if (fixed) this.ensureLockDir(conn, true);
-      }
+      this.refreshLocksAround(entity.id);
     }
 
     blockOnIncline(incline, t, spec = {}) {
@@ -985,11 +995,24 @@
 
     removeEntity(id) {
       const entity = this.entities.get(id);
-      if (!entity) return;
+      if (!entity || entity._removing) return;
+      entity._removing = true;
+      for (const point of [...this.entities.values()]) {
+        if (point.kind === 'point' && point.hostKind === 'entity' && point.hostId === id) {
+          this.removeEntity(point.id);
+        }
+      }
+      if (entity.kind === 'point' && entity.hostKind === 'connector') {
+        const host = this.connectors.get(entity.hostId);
+        if (host && Array.isArray(host.sliders)) {
+          host.sliders = host.sliders.filter((pid) => pid !== id);
+        }
+      }
       for (const conn of [...this.connectors.values()]) {
         if (conn.a.id === id || conn.b.id === id) this.removeConnector(conn.id, { silent: true });
       }
-      if (entity.kind === 'anchor') {
+      if (!this.entities.has(id)) return;
+      if (entity.kind === 'anchor' || entity.kind === 'point') {
         if (entity.proxy) this.Composite.remove(this.world, entity.proxy);
       } else if (entity.body) {
         this.Composite.remove(this.world, entity.body);
@@ -1016,7 +1039,10 @@
     }
 
     refFor(entity) {
-      return { kind: entity.kind === 'anchor' ? 'anchor' : 'body', id: entity.id };
+      if (!entity) return null;
+      if (entity.kind === 'anchor') return { kind: 'anchor', id: entity.id };
+      if (entity.kind === 'point') return { kind: 'point', id: entity.id };
+      return { kind: 'body', id: entity.id };
     }
 
     getRefEntity(ref) {
@@ -1026,16 +1052,478 @@
     getRefBody(ref) {
       const entity = this.getRefEntity(ref);
       if (!entity) return null;
-      return entity.kind === 'anchor' ? entity.proxy : entity.body;
+      if (entity.kind === 'anchor') return entity.proxy;
+      if (entity.kind === 'point') {
+        if (entity.proxy) return entity.proxy;
+        if (entity.hostKind === 'entity') {
+          const host = this.entities.get(entity.hostId);
+          return host && host.body ? host.body : null;
+        }
+        return null;
+      }
+      return entity.body || null;
+    }
+
+    getRopePathEntities(conn) {
+      const sliders = Array.isArray(conn.sliders)
+        ? conn.sliders
+            .map((pid) => this.entities.get(pid))
+            .filter((p) => p && p.kind === 'point' && p.proxy)
+            .sort((a, b) => (a.param || 0) - (b.param || 0))
+        : [];
+      return [conn.a, ...sliders, conn.b];
+    }
+
+    getRopePathPoints(conn) {
+      return this.getRopePathEntities(conn)
+        .map((entity) => this.getRefPoint(this.refFor(entity)))
+        .filter(Boolean);
+    }
+
+    getRopePathLength(conn) {
+      const nodes = this.getRopePathPoints(conn);
+      let total = 0;
+      for (let i = 1; i < nodes.length; i += 1) total += distance(nodes[i - 1], nodes[i]);
+      return total;
+    }
+
+    pointAtPathFraction(points, fraction) {
+      if (!Array.isArray(points) || !points.length) return null;
+      if (points.length === 1) return { x: points[0].x, y: points[0].y };
+      const lengths = [];
+      let total = 0;
+      for (let i = 1; i < points.length; i += 1) {
+        const len = distance(points[i - 1], points[i]);
+        lengths.push(len);
+        total += len;
+      }
+      if (total <= 1e-12) return { x: points[0].x, y: points[0].y };
+      let remaining = clamp(fraction, 0, 1) * total;
+      for (let i = 0; i < lengths.length; i += 1) {
+        const len = lengths[i];
+        if (remaining <= len || i === lengths.length - 1) {
+          const f = len > 1e-12 ? clamp(remaining / len, 0, 1) : 0;
+          const a = points[i];
+          const b = points[i + 1];
+          return { x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f };
+        }
+        remaining -= len;
+      }
+      const last = points[points.length - 1];
+      return { x: last.x, y: last.y };
+    }
+
+    projectOnPath(points, world) {
+      if (!Array.isArray(points) || points.length < 2 || !world) return null;
+      const lengths = [];
+      let total = 0;
+      for (let i = 1; i < points.length; i += 1) {
+        const len = distance(points[i - 1], points[i]);
+        lengths.push(len);
+        total += len;
+      }
+      if (total <= 1e-12) {
+        return { point: { x: points[0].x, y: points[0].y }, t: 0.5, distance: distance(world, points[0]), totalLength: 0 };
+      }
+      let walked = 0;
+      let best = null;
+      let bestDistance = Infinity;
+      for (let i = 0; i < lengths.length; i += 1) {
+        const a = points[i];
+        const b = points[i + 1];
+        const len = lengths[i];
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const len2 = dx * dx + dy * dy;
+        const f = len2 > 1e-12
+          ? clamp(((world.x - a.x) * dx + (world.y - a.y) * dy) / len2, 0, 1)
+          : 0;
+        const point = { x: a.x + dx * f, y: a.y + dy * f };
+        const d = distance(world, point);
+        if (d < bestDistance) {
+          bestDistance = d;
+          best = { point, t: (walked + len * f) / total, distance: d, totalLength: total };
+        }
+        walked += len;
+      }
+      return best;
+    }
+
+    /**
+     * 绳/弹绳的显示路径。绳上有滑点时按滑点分成若干段；松弛时每段都按其
+     * 直线长度占比分配下垂量，并采样成折线。命中和参数编辑都使用这条路径，
+     * 因此“绳长 1/3”是沿实际可见绳子的弧长，而不是两端点连线。
+     */
+    getRopeDisplayPath(conn, excludePointId = null) {
+      if (!conn) return null;
+      const entities = this.getRopePathEntities(conn);
+      const paired = [];
+      for (const entity of entities) {
+        if (excludePointId && entity.id === excludePointId) continue;
+        const point = this.getRefPoint(this.refFor(entity));
+        if (point) paired.push({ entity, point });
+      }
+      if (paired.length < 2) return null;
+
+      const screenNodes = paired.map(({ point }) => this.worldToScreen(point.x, point.y));
+      const screenLengths = [];
+      let screenTotal = 0;
+      let straightLength = 0;
+      for (let i = 1; i < paired.length; i += 1) {
+        const screenLen = distance(screenNodes[i - 1], screenNodes[i]);
+        const worldLen = distance(paired[i - 1].point, paired[i].point);
+        screenLengths.push(screenLen);
+        screenTotal += screenLen;
+        straightLength += worldLen;
+      }
+
+      const limit = conn.type === 'elastic'
+        ? (Number.isFinite(conn.restLength) ? conn.restLength : conn.length)
+        : conn.length;
+      const slack = Math.max(0, (Number.isFinite(limit) ? limit : straightLength) - straightLength);
+      const zoom = this.camera.zoom;
+      // 用世界尺度的下垂量，避免缩放画布时绳长参数跟着变化。
+      const sagWorld = slack > 0.008
+        ? (conn.type === 'elastic'
+            ? Math.min(0.26, 0.03 + slack * 1.05)
+            : Math.min(0.30, 0.04 + slack * 1.1))
+        : 0;
+      const totalSag = sagWorld * PPU * zoom;
+
+      const points = [];
+      const nodeDistances = [0];
+      let total = 0;
+      const append = (point) => {
+        if (!points.length) {
+          points.push(point);
+          return;
+        }
+        const last = points[points.length - 1];
+        const len = distance(last, point);
+        if (len <= 1e-9) return;
+        total += len;
+        points.push(point);
+      };
+
+      for (let i = 0; i < paired.length - 1; i += 1) {
+        const a = screenNodes[i];
+        const b = screenNodes[i + 1];
+        const segmentScreen = screenLengths[i];
+        const share = screenTotal > 1e-9 ? segmentScreen / screenTotal : 0;
+        const sag = totalSag * share;
+        const control = {
+          x: (a.x + b.x) / 2,
+          y: (a.y + b.y) / 2 + sag * 1.7
+        };
+        const steps = sag > 0.5 ? Math.max(4, Math.ceil(segmentScreen / 8)) : 1;
+        append(this.screenToWorld(a.x, a.y));
+        for (let k = 1; k <= steps; k += 1) {
+          const t = k / steps;
+          const mt = 1 - t;
+          const sx = mt * mt * a.x + 2 * mt * t * control.x + t * t * b.x;
+          const sy = mt * mt * a.y + 2 * mt * t * control.y + t * t * b.y;
+          append(this.screenToWorld(sx, sy));
+        }
+        nodeDistances.push(total);
+      }
+
+      const nodeFractions = nodeDistances.map((d, index) => (
+        total > 1e-12 ? clamp(d / total, 0, 1) : index / Math.max(1, paired.length - 1)
+      ));
+      return {
+        entities: paired.map(({ entity }) => entity),
+        nodes: paired.map(({ point }) => point),
+        points,
+        nodeFractions,
+        totalLength: total,
+        straightLength,
+        slack,
+        sag: totalSag
+      };
+    }
+
+    projectOnRopePath(conn, world) {
+      const info = this.getRopeDisplayPath(conn);
+      if (!info) return null;
+      const projected = this.projectOnPath(info.points, world);
+      if (!projected) return null;
+      return { ...projected, info };
     }
 
     getRefPoint(ref) {
       const entity = this.getRefEntity(ref);
       if (!entity) return null;
       if (entity.kind === 'anchor') return { x: entity.x, y: entity.y };
+      if (entity.kind === 'point') {
+        if (entity.proxy) return { x: entity.proxy.position.x, y: entity.proxy.position.y };
+        if (entity.hostKind === 'entity') {
+          const host = this.entities.get(entity.hostId);
+          return host && host.body ? this.localToWorld(host.body, entity.local) : null;
+        }
+        if (entity.hostKind === 'connector') {
+          const host = this.connectors.get(entity.hostId);
+          if (!host) return null;
+          if (host.type === 'rod') {
+            const pA = this.getRefPoint(host.a);
+            const pB = this.getRefPoint(host.b);
+            if (!pA || !pB) return null;
+            const t = clamp(entity.param ?? 0.5, 0, 1);
+            return { x: pA.x + (pB.x - pA.x) * t, y: pA.y + (pB.y - pA.y) * t };
+          }
+          const info = this.getRopeDisplayPath(host);
+          if (!info) return null;
+          return this.pointAtPathFraction(info.points, clamp(entity.param ?? 0.5, 0, 1));
+        }
+      }
       return entity.body ? { x: entity.body.position.x, y: entity.body.position.y } : null;
     }
 
+    getRefVelocity(ref) {
+      const supports = this.getRefSupports(ref);
+      const velocity = { x: 0, y: 0 };
+      for (const support of supports.supports) {
+        velocity.x += support.body.velocity.x * support.weight;
+        velocity.y += support.body.velocity.y * support.weight;
+      }
+      return velocity;
+    }
+
+    mergeSupports(supports) {
+      const map = new Map();
+      for (const support of supports) {
+        if (!support.body || support.weight <= 1e-9) continue;
+        const key = support.body.id;
+        const existing = map.get(key);
+        if (existing) existing.weight += support.weight;
+        else map.set(key, { body: support.body, weight: support.weight });
+      }
+      return [...map.values()];
+    }
+
+    invMassOf(supports) {
+      let sum = 0;
+      for (const support of supports) {
+        if (support.body.isStatic) continue;
+        sum += support.body.inverseMass * support.weight * support.weight;
+      }
+      return sum;
+    }
+
+    getRefSupports(ref) {
+      const entity = this.getRefEntity(ref);
+      if (!entity) return { position: null, supports: [], invMass: 0, massless: true };
+      if (entity.kind === 'anchor') {
+        return { position: { x: entity.x, y: entity.y }, supports: [], invMass: 0, massless: true };
+      }
+      if (entity.kind === 'point') {
+        if (entity.proxy) {
+          // 硬杆上的滑点只能沿杆滑动，因此求解长度约束时视为不可沿法向推动
+          // （invMass = 0）。轻绳上的滑点则等价于一个可自由移动的动点：
+          // 绳子的总长约束本身会把它拉回绳长范围，若仍把法向锁死，挂上重物后
+          // 滑点无法向下运动，绳子便永远保持松弛，或在斜向受力时被拉长。
+          const host = entity.hostKind === 'connector' ? this.connectors.get(entity.hostId) : null;
+          const constrained = entity.pointType === 'slider'
+            && entity.hostKind === 'connector'
+            && (!host || host.type === 'rod');
+          return {
+            position: { x: entity.proxy.position.x, y: entity.proxy.position.y },
+            supports: [{ body: entity.proxy, weight: 1 }],
+            invMass: constrained || entity.proxy.isStatic ? 0 : entity.proxy.inverseMass,
+            massless: true
+          };
+        }
+        if (entity.hostKind === 'connector') {
+          const host = this.connectors.get(entity.hostId);
+          if (host && (host.type === 'rod' || host.type === 'rope' || host.type === 'elastic')) {
+            const t = clamp(entity.param ?? 0.5, 0, 1);
+            const sA = this.getRefSupports(host.a);
+            const sB = this.getRefSupports(host.b);
+            const supports = this.mergeSupports([
+              ...sA.supports.map((support) => ({ ...support, weight: support.weight * (1 - t) })),
+              ...sB.supports.map((support) => ({ ...support, weight: support.weight * t }))
+            ]);
+            const position = this.getRefPoint(ref)
+              || (sA.position && sB.position
+                ? {
+                    x: sA.position.x + (sB.position.x - sA.position.x) * t,
+                    y: sA.position.y + (sB.position.y - sA.position.y) * t
+                  }
+                : null);
+            return { position, supports, invMass: this.invMassOf(supports), massless: true };
+          }
+        }
+        if (entity.hostKind === 'entity') {
+          const host = this.entities.get(entity.hostId);
+          if (host && host.body) {
+            return {
+              position: this.localToWorld(host.body, entity.local),
+              supports: [{ body: host.body, weight: 1 }],
+              invMass: host.body.isStatic ? 0 : host.body.inverseMass,
+              massless: true
+            };
+          }
+        }
+        const position = this.getRefPoint(ref);
+        return { position, supports: [], invMass: 0, massless: true };
+      }
+      if (entity.body) {
+        return {
+          position: { x: entity.body.position.x, y: entity.body.position.y },
+          supports: [{ body: entity.body, weight: 1 }],
+          invMass: entity.body.isStatic ? 0 : entity.body.inverseMass,
+          massless: false
+        };
+      }
+      return { position: null, supports: [], invMass: 0, massless: true };
+    }
+
+    translateRef(ref, delta) {
+      const supports = this.getRefSupports(ref);
+      if (supports.invMass <= 1e-12) return;
+      for (const support of supports.supports) {
+        if (support.body.isStatic) continue;
+        const factor = support.weight * support.body.inverseMass / supports.invMass;
+        this.Body.setPosition(support.body, {
+          x: support.body.position.x + delta.x * factor,
+          y: support.body.position.y + delta.y * factor
+        });
+      }
+    }
+
+    applyRefVelocityDelta(ref, delta) {
+      const supports = this.getRefSupports(ref);
+      if (supports.invMass <= 1e-12) return;
+      for (const support of supports.supports) {
+        if (support.body.isStatic) continue;
+        const factor = support.weight * support.body.inverseMass / supports.invMass;
+        this.Body.setVelocity(support.body, {
+          x: support.body.velocity.x + delta.x * factor,
+          y: support.body.velocity.y + delta.y * factor
+        });
+      }
+    }
+
+    // 按两端有效质量分配位置/速度修正量，保证固定方向连接件的反作用力
+    // 也会作用在“固定端”上（例如固定端是自由物块、另一端是锚点时）。
+    applyPairPositionCorrection(refA, refB, axis, error) {
+      if (!axis || !Number.isFinite(error) || Math.abs(error) < 1e-9) return;
+      const sA = this.getRefSupports(refA);
+      const sB = this.getRefSupports(refB);
+      const invSum = sA.invMass + sB.invMass;
+      if (invSum <= 1e-12) return;
+      const shareA = sA.invMass / invSum;
+      const shareB = sB.invMass / invSum;
+      this.translateRef(refA, { x: axis.x * error * shareA, y: axis.y * error * shareA });
+      this.translateRef(refB, { x: -axis.x * error * shareB, y: -axis.y * error * shareB });
+    }
+
+    applyPairVelocityCorrection(refA, refB, axis) {
+      if (!axis) return;
+      const sA = this.getRefSupports(refA);
+      const sB = this.getRefSupports(refB);
+      const invSum = sA.invMass + sB.invMass;
+      if (invSum <= 1e-12) return;
+      const vA = this.getRefVelocity(refA);
+      const vB = this.getRefVelocity(refB);
+      const rel = (vB.x - vA.x) * axis.x + (vB.y - vA.y) * axis.y;
+      if (!Number.isFinite(rel) || Math.abs(rel) < 1e-9) return;
+      const impulse = rel / invSum;
+      this.applyRefVelocityDelta(refA, {
+        x: axis.x * impulse * sA.invMass,
+        y: axis.y * impulse * sA.invMass
+      });
+      this.applyRefVelocityDelta(refB, {
+        x: -axis.x * impulse * sB.invMass,
+        y: -axis.y * impulse * sB.invMass
+      });
+    }
+
+    getSliderHostTangent(ref) {
+      const entity = this.getRefEntity(ref);
+      if (!entity || entity.kind !== 'point' || entity.pointType !== 'slider') return null;
+      if (!entity.proxy || entity.proxy.isStatic || entity.hostKind !== 'connector') return null;
+      const host = this.connectors.get(entity.hostId);
+      if (!host) return null;
+      if (host.type === 'rod') {
+        const pA = this.getRefPoint(host.a);
+        const pB = this.getRefPoint(host.b);
+        if (!pA || !pB) return null;
+        const dx = pB.x - pA.x;
+        const dy = pB.y - pA.y;
+        const len = Math.hypot(dx, dy);
+        if (len <= 1e-9) return null;
+        return { x: dx / len, y: dy / len };
+      }
+      if (host.type !== 'rope') return null;
+
+      const info = this.getRopeDisplayPath(host);
+      if (!info) return null;
+      const index = info.entities.findIndex((item) => item.id === entity.id);
+      if (index < 0) return null;
+      const node = info.nodes[index];
+      const prev = info.nodes[index - 1];
+      const next = info.nodes[index + 1];
+      if (!node) return null;
+      let dx = 0;
+      let dy = 0;
+      if (prev && next) {
+        dx = next.x - prev.x;
+        dy = next.y - prev.y;
+      } else if (next) {
+        dx = next.x - node.x;
+        dy = next.y - node.y;
+      } else if (prev) {
+        dx = node.x - prev.x;
+        dy = node.y - prev.y;
+      }
+      const len = Math.hypot(dx, dy);
+      if (len <= 1e-9) return null;
+      return { x: dx / len, y: dy / len };
+    }
+
+    nudgeSliderAlongHost(ref, delta) {
+      const entity = this.getRefEntity(ref);
+      if (!entity || entity.kind !== 'point' || entity.pointType !== 'slider') return false;
+      if (!entity.proxy || entity.proxy.isStatic || entity.hostKind !== 'connector') return false;
+      const tangent = this.getSliderHostTangent(ref);
+      if (!tangent) return false;
+      const along = delta.x * tangent.x + delta.y * tangent.y;
+      if (!Number.isFinite(along) || Math.abs(along) < 1e-9) return false;
+      const pos = entity.proxy.position;
+      this.Body.setPosition(entity.proxy, {
+        x: pos.x + tangent.x * along,
+        y: pos.y + tangent.y * along
+      });
+      return true;
+    }
+
+    nudgeSliderVelocityAlongHost(ref, delta) {
+      const entity = this.getRefEntity(ref);
+      if (!entity || entity.kind !== 'point' || entity.pointType !== 'slider') return false;
+      if (!entity.proxy || entity.proxy.isStatic || entity.hostKind !== 'connector') return false;
+      const tangent = this.getSliderHostTangent(ref);
+      if (!tangent) return false;
+      const along = delta.x * tangent.x + delta.y * tangent.y;
+      if (!Number.isFinite(along) || Math.abs(along) < 1e-9) return false;
+      const velocity = entity.proxy.velocity;
+      this.Body.setVelocity(entity.proxy, {
+        x: velocity.x + tangent.x * along,
+        y: velocity.y + tangent.y * along
+      });
+      return true;
+    }
+
+    applyForceAtRef(ref, force) {
+      const supports = this.getRefSupports(ref);
+      if (!supports.position) return;
+      for (const support of supports.supports) {
+        if (support.body.isStatic) continue;
+        this.Body.applyForce(support.body, supports.position, {
+          x: force.x * support.weight * FORCE_UNIT,
+          y: force.y * support.weight * FORCE_UNIT
+        });
+      }
+    }
     getRefName(ref) {
       const entity = this.getRefEntity(ref);
       return entity ? entity.name : '已删除';
@@ -1045,6 +1533,8 @@
       if (!entity) return;
       if (entity.kind === 'anchor') {
         entity.home = { x: entity.x, y: entity.y };
+      } else if (entity.kind === 'point') {
+        if (entity.proxy) entity.home = { x: entity.proxy.position.x, y: entity.proxy.position.y };
       } else if (entity.body) {
         entity.home = {
           x: entity.body.position.x,
@@ -1120,71 +1610,95 @@
         name: spec.name || this.nextName(type),
         a: { ...refA },
         b: { ...refB },
-        k: clamp(Number(spec.k) || 30, 1, 100),
+        k: clamp(Number(spec.k) || 30, 1, 100000),
         restLength: clamp(Number(spec.restLength) || span * 0.85, 0.05, 20),
         length: clamp(Number(spec.length) || span, 0.05, 20),
+        fixedA: Boolean(spec.fixedA),
+        fixedB: Boolean(spec.fixedB),
+        sliders: Array.isArray(spec.sliders) ? [...spec.sliders] : [],
         lockDir: null,
+        _lockSign: 1,
         constraint: null,
         _state: 'neutral'
       };
       if (type === 'rod' || type === 'rope') conn.length = clamp(Number(spec.length) || span, 0.05, 20);
+      if (type !== 'spring' && type !== 'rod') {
+        conn.fixedA = false;
+        conn.fixedB = false;
+      }
       this.connectors.set(id, conn);
-      if (this.getFixedAnchorInfo(conn)) this.ensureLockDir(conn, true);
+      if (this.getFixedInfo(conn)) this.ensureLockDir(conn, true);
       this.syncConnectorConstraint(conn);
       if (options.select) this.select(id, { openPanel: false });
       return conn;
     }
 
-    getFixedAnchorInfo(conn) {
-      for (const [ref, other] of [[conn.a, conn.b], [conn.b, conn.a]]) {
-        if (ref.kind !== 'anchor') continue;
-        const anchor = this.entities.get(ref.id);
-        if (anchor && anchor.fixedDirection) {
-          return { anchor, anchorRef: ref, otherRef: other };
-        }
-      }
+    getFixedInfo(conn) {
+      if (!conn || (conn.type !== 'spring' && conn.type !== 'rod')) return null;
+      if (conn.fixedA && conn.a) return { fixedRef: conn.a, otherRef: conn.b, end: 'a' };
+      if (conn.fixedB && conn.b) return { fixedRef: conn.b, otherRef: conn.a, end: 'b' };
       return null;
     }
 
     ensureLockDir(conn, force = false) {
-      const info = this.getFixedAnchorInfo(conn);
+      const info = this.getFixedInfo(conn);
       if (!info) {
         conn.lockDir = null;
         return null;
       }
-      const pAnchor = { x: info.anchor.x, y: info.anchor.y };
+      const pFixed = this.getRefPoint(info.fixedRef);
       const pOther = this.getRefPoint(info.otherRef);
-      if (!pOther) return conn.lockDir;
-      const raw = { x: pOther.x - pAnchor.x, y: pOther.y - pAnchor.y };
+      if (!pFixed || !pOther) return conn.lockDir;
+      const raw = { x: pOther.x - pFixed.x, y: pOther.y - pFixed.y };
       if (force || !conn.lockDir) {
         conn.lockDir = normalize(raw, conn.lockDir || { x: 0, y: 1 });
+        conn._lockSign = dot(raw, conn.lockDir) >= 0 ? 1 : -1;
+        if (lengthOf(raw) < 1e-6) conn._lockSign = 1;
       }
       return conn.lockDir;
     }
 
+    setConnectorFixedEnd(conn, end, fixed) {
+      if (!conn || (conn.type !== 'spring' && conn.type !== 'rod')) return;
+      if (end === 'b') {
+        conn.fixedB = Boolean(fixed);
+        if (conn.fixedB) conn.fixedA = false;
+      } else {
+        conn.fixedA = Boolean(fixed);
+        if (conn.fixedA) conn.fixedB = false;
+      }
+      conn.lockDir = null;
+      if (this.getFixedInfo(conn)) this.ensureLockDir(conn, true);
+    }
+
     refreshLocksAround(entityId) {
-      for (const conn of this.getAttachedConnectors(entityId)) {
-        if (this.getFixedAnchorInfo(conn)) this.ensureLockDir(conn, true);
+      const targets = new Set();
+      for (const conn of this.getAttachedConnectors(entityId)) targets.add(conn.id);
+      for (const point of this.entities.values()) {
+        if (point.kind !== 'point' || point.hostKind !== 'entity' || point.hostId !== entityId) continue;
+        for (const conn of this.getAttachedConnectors(point.id)) targets.add(conn.id);
+      }
+      for (const connId of targets) {
+        const conn = this.connectors.get(connId);
+        if (conn && this.getFixedInfo(conn)) this.ensureLockDir(conn, true);
       }
     }
 
     getAttachedConnectors(entityId) {
       const result = [];
+      const entity = this.entities.get(entityId);
       for (const conn of this.connectors.values()) {
         if (conn.a.id === entityId || conn.b.id === entityId) result.push(conn);
       }
-      return result;
-    }
-
-    setAnchorFixed(entity, fixed) {
-      entity.fixedDirection = Boolean(fixed);
-      for (const conn of this.getAttachedConnectors(entity.id)) {
-        if (entity.fixedDirection) {
-          this.ensureLockDir(conn, true);
-        } else {
-          conn.lockDir = null;
+      if (entity && entity.kind !== 'point') {
+        for (const point of this.entities.values()) {
+          if (point.kind !== 'point' || point.hostKind !== 'entity' || point.hostId !== entityId) continue;
+          for (const conn of this.connectors.values()) {
+            if ((conn.a.id === point.id || conn.b.id === point.id) && !result.includes(conn)) result.push(conn);
+          }
         }
       }
+      return result;
     }
 
     syncConnectorConstraint(conn) {
@@ -1192,26 +1706,7 @@
         this.Composite.remove(this.world, conn.constraint);
         conn.constraint = null;
       }
-      // Only a rigid rod is a two-sided constraint. A rope is one-sided and is
-      // solved by applyRopeConstraints() instead of a Matter constraint, which
-      // would also push the bodies apart when compressed.
-      if (conn.type !== 'rod') return;
-      const bodyA = this.getRefBody(conn.a);
-      const bodyB = this.getRefBody(conn.b);
-      if (!bodyA || !bodyB) return;
-      const constraint = this.Constraint.create({
-        bodyA,
-        bodyB,
-        pointA: { x: 0, y: 0 },
-        pointB: { x: 0, y: 0 },
-        length: clamp(conn.length, 0.05, 20),
-        stiffness: 1,
-        damping: 0,
-        render: { visible: false }
-      });
-      constraint._connectorId = conn.id;
-      this.Composite.add(this.world, constraint);
-      conn.constraint = constraint;
+      // 轻绳/轻硬杆/弹簧由自定义求解器处理，Matter 约束不再参与。
     }
 
     syncAllConnectors() {
@@ -1220,10 +1715,26 @@
 
     removeConnector(id, options = {}) {
       const conn = this.connectors.get(id);
-      if (!conn) return;
+      if (!conn || conn._removing) return;
+      conn._removing = true;
+      const splitPoints = [];
+      for (const ref of [conn.a, conn.b]) {
+        const point = ref && this.entities.get(ref.id);
+        if (point && point.kind === 'point' && point._split) splitPoints.push(point.id);
+      }
+      for (const point of [...this.entities.values()]) {
+        if (point.kind !== 'point' || point.hostKind !== 'connector' || point.hostId !== id) continue;
+        if (point._split) continue;
+        this.removeEntity(point.id);
+      }
       if (conn.constraint) this.Composite.remove(this.world, conn.constraint);
       this.connectors.delete(id);
       if (this.state.selectedId === id) this.state.selectedId = null;
+      if (!options.keepSplitPoints) {
+        for (const pointId of splitPoints) {
+          if (this.entities.has(pointId)) this.removeEntity(pointId);
+        }
+      }
       if (!options.silent) this.updateLiveReadouts(true);
     }
 
@@ -1234,6 +1745,7 @@
     }
 
     connectorSpan(conn) {
+      if (conn.type === 'rope' || conn.type === 'elastic') return this.getRopePathLength(conn);
       const pA = this.getRefPoint(conn.a);
       const pB = this.getRefPoint(conn.b);
       if (!pA || !pB) return 0;
@@ -1244,23 +1756,38 @@
       if (conn.type !== 'spring' && conn.type !== 'elastic') {
         return { magnitude: 0, a: { x: 0, y: 0 }, b: { x: 0, y: 0 } };
       }
-      const fixed = this.getFixedAnchorInfo(conn);
+      if (conn.type === 'elastic' && conn.sliders && conn.sliders.length) {
+        const nodes = this.getRopePathPoints(conn);
+        if (nodes.length < 2) return { magnitude: 0, a: { x: 0, y: 0 }, b: { x: 0, y: 0 } };
+        let span = 0;
+        for (let i = 1; i < nodes.length; i += 1) span += distance(nodes[i - 1], nodes[i]);
+        const raw = conn.k * Math.max(0, span - conn.restLength);
+        const first = nodes[0];
+        const second = nodes[1];
+        const last = nodes[nodes.length - 1];
+        const prev = nodes[nodes.length - 2];
+        const uA = normalize({ x: first.x - second.x, y: first.y - second.y }, { x: 0, y: 1 });
+        const uB = normalize({ x: last.x - prev.x, y: last.y - prev.y }, { x: 0, y: 1 });
+        return {
+          magnitude: raw,
+          a: { x: uA.x * raw, y: uA.y * raw },
+          b: { x: uB.x * raw, y: uB.y * raw }
+        };
+      }
+      const fixed = this.getFixedInfo(conn);
       if (fixed) {
-        const anchorPos = { x: fixed.anchor.x, y: fixed.anchor.y };
-        const dir = this.ensureLockDir(conn) || normalize({
-          x: pB.x - pA.x,
-          y: pB.y - pA.y
-        });
-        const pOther = this.getRefPoint(fixed.otherRef) || anchorPos;
-        const extension = dot({ x: pOther.x - anchorPos.x, y: pOther.y - anchorPos.y }, dir);
+        const pFixed = this.getRefPoint(fixed.fixedRef) || pA;
+        const dir = this.ensureLockDir(conn) || normalize({ x: pB.x - pA.x, y: pB.y - pA.y });
+        const pOther = this.getRefPoint(fixed.otherRef) || pFixed;
+        const extension = dot({ x: pOther.x - pFixed.x, y: pOther.y - pFixed.y }, dir);
         const raw = conn.type === 'spring'
           ? conn.k * (extension - conn.restLength)
           : conn.k * Math.max(0, extension - conn.restLength);
         const onOther = { x: -dir.x * raw, y: -dir.y * raw };
         return {
-          magnitude: raw,
-          a: fixed.anchorRef.id === conn.a.id ? { x: 0, y: 0 } : onOther,
-          b: fixed.anchorRef.id === conn.b.id ? { x: 0, y: 0 } : onOther
+          magnitude: Math.abs(raw),
+          a: fixed.fixedRef.id === conn.a.id ? { x: 0, y: 0 } : onOther,
+          b: fixed.fixedRef.id === conn.b.id ? { x: 0, y: 0 } : onOther
         };
       }
       const dx = pB.x - pA.x;
@@ -1272,7 +1799,7 @@
         ? conn.k * (span - conn.restLength)
         : conn.k * Math.max(0, span - conn.restLength);
       return {
-        magnitude: raw,
+        magnitude: Math.abs(raw),
         a: { x: ux * raw, y: uy * raw },
         b: { x: -ux * raw, y: -uy * raw }
       };
@@ -1286,9 +1813,13 @@
       this.endForceDrag();
       this.clearHistory();
       this.resetEngine();
-      this.counters = { block: 0, incline: 0, anchor: 0, spring: 0, elastic: 0, rod: 0, rope: 0 };
+      this.counters = {
+        block: 0, incline: 0, anchor: 0, spring: 0, elastic: 0, rod: 0, rope: 0,
+        dynamic: 0, slider: 0
+      };
       this.state.selectedId = null;
       this.state.pendingConnector = null;
+      this.state.pendingPoint = null;
       this.state.simTime = 0;
       this.state.running = false;
       this.setHint('');
@@ -1316,16 +1847,16 @@
           mass: 2, width: 0.65, height: 0.45, friction: 0.22
         });
       } else if (name === 'spring') {
-        const anchor = this.createAnchor({ x: 0, y: -4.4, fixedDirection: true });
+        const anchor = this.createAnchor({ x: 0, y: -4.4 });
         const block = this.createBlock({
           position: { x: 0, y: -2.7 },
           mass: 1, width: 0.55, height: 0.55, friction: 0.4
         });
         this.createConnector('spring', this.refFor(anchor), this.refFor(block), {
-          k: 28, restLength: 1.05
+          k: 28, restLength: 1.05, fixedA: true
         });
       } else if (name === 'pendulum') {
-        const anchor = this.createAnchor({ x: 0, y: -4.35, fixedDirection: false });
+        const anchor = this.createAnchor({ x: 0, y: -4.35 });
         const block = this.createBlock({
           position: { x: 1.7, y: -2.65 },
           mass: 2, width: 0.6, height: 0.6, friction: 0.4
@@ -1341,13 +1872,13 @@
         this.blockOnIncline(ramp, 0.22, {
           mass: 1.5, width: 0.55, height: 0.35, friction: 0.12
         });
-        const anchor = this.createAnchor({ x: 2.55, y: -4.2, fixedDirection: true });
+        const anchor = this.createAnchor({ x: 2.55, y: -4.2 });
         const hanging = this.createBlock({
           position: { x: 2.55, y: -2.72 },
           mass: 1, width: 0.55, height: 0.55, friction: 0.4
         });
         this.createConnector('spring', this.refFor(anchor), this.refFor(hanging), {
-          k: 30, restLength: 1.05
+          k: 30, restLength: 1.05, fixedA: true
         });
       }
 
@@ -1427,9 +1958,9 @@
       let x = this.camera.x;
       let y = this.camera.y;
       if (y > -0.8) y = -1.8;
-      const anchor = this.createAnchor({ x, y, fixedDirection: false });
+      const anchor = this.createAnchor({ x, y });
       this.select(anchor.id, { openPanel: true });
-      this.toast('已添加锚点；可在属性中锁定连接方向');
+      this.toast('已添加锚点；固定方向请在硬杆/弹簧属性中按端点设置');
     }
 
     startConnectorPick(type) {
@@ -1451,8 +1982,8 @@
     handleConnectorPick(hit) {
       const pending = this.state.pendingConnector;
       if (!pending) return;
-      if (!hit || (hit.type !== 'anchor' && hit.type !== 'body')) {
-        this.toast('请点击物块、斜面或锚点作为端点');
+      if (!hit || (hit.type !== 'anchor' && hit.type !== 'body' && hit.type !== 'point')) {
+        this.toast('请点击物块、斜面、锚点或动点/滑点作为端点');
         return;
       }
       const entity = this.entities.get(hit.id);
@@ -1479,9 +2010,382 @@
       }
     }
 
-    /* ======================================================================
-       Simulation
-       ====================================================================== */
+    startPointPlacement(pointType) {
+      this.ensureEditMode();
+      this.state.pendingConnector = null;
+      this.state.pendingPoint = { pointType };
+      this.state.selectedId = null;
+      this.updateModeUI();
+      this.setHint(pointType === 'slider'
+        ? '点击一根轻绳或轻硬杆放置滑点 · Esc 取消'
+        : '点击物体或连接件放置动点 · Esc 取消');
+      this.openPanel('objects');
+      if (this.state.openPanel) this.renderPanel();
+    }
+
+    cancelPointPlacement() {
+      this.state.pendingPoint = null;
+      this.setHint('');
+      this.updateModeUI();
+      if (this.state.openPanel) this.renderPanel();
+    }
+
+    buildPointProxy(point, position) {
+      const proxy = this.Bodies.circle(position.x, position.y, 0.001, {
+        isStatic: false,
+        isSensor: true,
+        label: point.name,
+        collisionFilter: { category: 0, mask: 0, group: 0 },
+        render: { visible: false }
+      });
+      // 拆分结点和轻绳滑点是绳上的中继点：给它们一个等效质量，绳长约束
+      // 才能把载荷传给两端物体。硬杆滑点由杆的长度约束直接投影，不需要
+      // 额外惯性，仍使用轻量代理体。
+      const host = point.hostKind === 'connector' ? this.connectors.get(point.hostId) : null;
+      const relayPoint = point._split || (
+        point.pointType === 'slider' && host && (host.type === 'rope' || host.type === 'elastic')
+      );
+      this.Body.setMass(proxy, relayPoint ? SPLIT_POINT_MASS : POINT_PROXY_MASS);
+      this.initializeBodyRuntime(proxy);
+      proxy._pointId = point.id;
+      this.Composite.add(this.world, proxy);
+      point.proxy = proxy;
+      point.home = { x: position.x, y: position.y };
+      return proxy;
+    }
+
+    createPointEntity(spec) {
+      const id = this.nextId('p');
+      const point = {
+        id,
+        kind: 'point',
+        pointType: spec.pointType,
+        name: spec.name || this.nextName(spec.pointType),
+        hostKind: spec.hostKind,
+        hostId: spec.hostId,
+        param: spec.param,
+        local: spec.local || null,
+        proxy: null,
+        home: null,
+        _split: Boolean(spec._split)
+      };
+      this.entities.set(id, point);
+      if (spec.position && (spec.pointType === 'slider' || spec._split)) {
+        this.buildPointProxy(point, spec.position);
+      }
+      return point;
+    }
+
+    createDynamicOnEntity(entity, world) {
+      if (!entity || !entity.body) return null;
+      const local = this.worldToLocal(entity.body, world);
+      return this.createPointEntity({
+        pointType: 'dynamic',
+        hostKind: 'entity',
+        hostId: entity.id,
+        local,
+        position: world
+      });
+    }
+
+    projectOnConnector(conn, world) {
+      const pA = this.getRefPoint(conn.a);
+      const pB = this.getRefPoint(conn.b);
+      if (!pA || !pB) return null;
+      const dx = pB.x - pA.x;
+      const dy = pB.y - pA.y;
+      const len2 = dx * dx + dy * dy;
+      const t = len2 > 1e-12 ? clamp(((world.x - pA.x) * dx + (world.y - pA.y) * dy) / len2, 0, 1) : 0.5;
+      return { t, point: { x: pA.x + dx * t, y: pA.y + dy * t }, pA, pB };
+    }
+
+    createDynamicOnRod(conn, world) {
+      const proj = this.projectOnConnector(conn, world);
+      if (!proj) return null;
+      const t = clamp(proj.t, 0.04, 0.96);
+      return this.createPointEntity({
+        pointType: 'dynamic',
+        hostKind: 'connector',
+        hostId: conn.id,
+        param: t,
+        position: proj.point
+      });
+    }
+
+    createSliderOnConnector(conn, world) {
+      if (!conn || (conn.type !== 'rod' && conn.type !== 'rope')) return null;
+      const isRope = conn.type === 'rope';
+      const proj = isRope ? this.projectOnRopePath(conn, world) : this.projectOnConnector(conn, world);
+      if (!proj) return null;
+      const t = clamp(proj.t, 0.04, 0.96);
+      const position = isRope
+        ? this.pointAtPathFraction(proj.info.points, t)
+        : {
+            x: proj.pA.x + (proj.pB.x - proj.pA.x) * t,
+            y: proj.pA.y + (proj.pB.y - proj.pA.y) * t
+          };
+      const point = this.createPointEntity({
+        pointType: 'slider',
+        hostKind: 'connector',
+        hostId: conn.id,
+        param: t,
+        position
+      });
+      if (!Array.isArray(conn.sliders)) conn.sliders = [];
+      conn.sliders.push(point.id);
+      return point;
+    }
+
+    getPointerWorld() {
+      return this.screenToWorld(this.pointer.x, this.pointer.y);
+    }
+
+    handlePointPlacement(hit) {
+      const pending = this.state.pendingPoint;
+      if (!pending) return;
+      let created = null;
+      if (pending.pointType === 'slider') {
+        if (!hit || hit.type !== 'connector') {
+          this.toast('滑点只能放在轻绳或轻硬杆上');
+          return;
+        }
+        const conn = this.connectors.get(hit.id);
+        if (!conn || (conn.type !== 'rod' && conn.type !== 'rope')) {
+          this.toast('滑点只能连接在轻绳或轻硬杆上');
+          return;
+        }
+        created = this.createSliderOnConnector(conn, this.getPointerWorld());
+        if (created) this.toast('已添加滑点：无质量、无摩擦，可连接其他物体');
+      } else {
+        if (!hit) {
+          this.toast('请点击一个物体或连接件');
+          return;
+        }
+        if (hit.type === 'body') {
+          const entity = this.entities.get(hit.id);
+          created = this.createDynamicOnEntity(entity, this.getPointerWorld());
+          if (created) this.toast('已添加动点：无质量，可作为连接或受力点');
+        } else if (hit.type === 'connector') {
+          const conn = this.connectors.get(hit.id);
+          if (conn && conn.type === 'rod') {
+            created = this.createDynamicOnRod(conn, this.getPointerWorld());
+            if (created) this.toast('已添加动点：固定在硬杆上，可连接其他物体');
+          } else if (conn && (conn.type === 'rope' || conn.type === 'elastic' || conn.type === 'spring')) {
+            if (this.getFixedInfo(conn)) {
+              this.toast('固定方向的弹簧不能拆分，请先关闭固定方向');
+              return;
+            }
+            created = this.splitConnectorAtPoint(conn, this.getPointerWorld());
+            if (created) this.toast('已在连接件中部添加动点');
+          }
+        } else {
+          this.toast('动点需要依附在物体或连接件上');
+          return;
+        }
+      }
+      if (!created) return;
+      this.state.pendingPoint = null;
+      this.setHint('');
+      this.updateModeUI();
+      this.openPanel('objects');
+      this.select(created.id, { openPanel: false });
+      if (this.state.openPanel) this.renderPanel(true);
+    }
+
+
+    splitConnectorAtPoint(conn, world) {
+      if (!conn || (conn.type !== 'rope' && conn.type !== 'elastic' && conn.type !== 'spring')) return null;
+      if (this.getFixedInfo(conn)) return null;
+      const ropeLike = conn.type === 'rope' || conn.type === 'elastic';
+      const proj = ropeLike
+        ? this.projectOnRopePath(conn, world)
+        : this.projectOnConnector(conn, world);
+      if (!proj) return null;
+      const t = clamp(proj.t, 0.08, 0.92);
+
+      const totalLength = Number.isFinite(conn.length) ? conn.length : conn.restLength;
+      const restLength = Number.isFinite(conn.restLength) ? conn.restLength : totalLength;
+      const minPart = 0.05;
+      if (!(totalLength >= minPart * 2) || (conn.type !== 'rope' && !(restLength >= minPart * 2))) {
+        this.toast('连接件太短，无法再拆分');
+        return null;
+      }
+      // 两段长度都从总长中按比例切出，第二段用减法得到，保证 l1 + l2 严格等于总长。
+      const allocate = (total) => {
+        const first = clamp(total * t, minPart, total - minPart);
+        return [first, total - first];
+      };
+      const [length1, length2] = allocate(totalLength);
+      const [rest1, rest2] = allocate(restLength);
+      const position = ropeLike
+        ? this.pointAtPathFraction(proj.info.points, t)
+        : {
+            x: proj.pA.x + (proj.pB.x - proj.pA.x) * t,
+            y: proj.pA.y + (proj.pB.y - proj.pA.y) * t
+          };
+
+      const oldA = { ...conn.a };
+      const oldB = { ...conn.b };
+      const oldSliders = Array.isArray(conn.sliders) ? [...conn.sliders] : [];
+      const point = this.createPointEntity({
+        pointType: 'dynamic',
+        hostKind: 'connector',
+        hostId: conn.id,
+        param: t,
+        position,
+        _split: true
+      });
+      const refP = this.refFor(point);
+
+      let spec1;
+      let spec2;
+      if (conn.type === 'rope') {
+        spec1 = { name: `${conn.name}·1`, length: length1 };
+        spec2 = { name: `${conn.name}·2`, length: length2 };
+      } else {
+        spec1 = {
+          name: `${conn.name}·1`, k: conn.k * restLength / rest1,
+          restLength: rest1, length: length1
+        };
+        spec2 = {
+          name: `${conn.name}·2`, k: conn.k * restLength / rest2,
+          restLength: rest2, length: length2
+        };
+      }
+
+      const seg1 = this.createConnector(conn.type, oldA, refP, spec1);
+      const seg2 = this.createConnector(conn.type, refP, oldB, spec2);
+      if (!seg1 || !seg2) {
+        if (seg1) this.removeConnector(seg1.id, { silent: true });
+        if (seg2) this.removeConnector(seg2.id, { silent: true });
+        this.removeEntity(point.id);
+        return null;
+      }
+
+      for (const pid of oldSliders) {
+        const slider = this.entities.get(pid);
+        if (!slider || slider.kind !== 'point') continue;
+        const oldParam = Number.isFinite(slider.param) ? slider.param : 0.5;
+        if (oldParam <= t) {
+          slider.hostId = seg1.id;
+          slider.param = t > 1e-6 ? clamp(oldParam / t, 0.02, 0.98) : 0.5;
+          seg1.sliders.push(slider.id);
+        } else {
+          slider.hostId = seg2.id;
+          slider.param = t < 1 - 1e-6 ? clamp((oldParam - t) / (1 - t), 0.02, 0.98) : 0.5;
+          seg2.sliders.push(slider.id);
+        }
+      }
+
+      this.removeConnector(conn.id, { silent: true, keepSplitPoints: true });
+      point.hostKind = 'split';
+      point.hostId = null;
+      point.param = 0.5;
+      return point;
+    }
+
+    movePointTo(point, world) {
+      if (!point || point.kind !== 'point' || point._split || point.hostKind === 'split') return false;
+      if (point.hostKind === 'entity') {
+        const host = this.entities.get(point.hostId);
+        if (!host || !host.body) return false;
+        point.local = this.worldToLocal(host.body, world);
+        return true;
+      }
+      if (point.hostKind === 'connector') {
+        const host = this.connectors.get(point.hostId);
+        if (!host) return false;
+        if (host.type === 'rod') {
+          const proj = this.projectOnConnector(host, world);
+          if (!proj) return false;
+          point.param = clamp(proj.t, 0.02, 0.98);
+          if (point.proxy) this.Body.setPosition(point.proxy, proj.point);
+        } else if (point.proxy) {
+          this.Body.setPosition(point.proxy, world);
+          if (point.pointType === 'slider') this.updateRopeSliderParam(point, host);
+        }
+        return true;
+      }
+      return false;
+    }
+
+    positionSliderAtFraction(point, host, fraction) {
+      if (!point || !point.proxy || !host) return false;
+      if (host.type === 'rod') {
+        const pA = this.getRefPoint(host.a);
+        const pB = this.getRefPoint(host.b);
+        if (!pA || !pB) return false;
+        const t = clamp(fraction, 0.01, 0.99);
+        this.Body.setPosition(point.proxy, {
+          x: pA.x + (pB.x - pA.x) * t,
+          y: pA.y + (pB.y - pA.y) * t
+        });
+        return true;
+      }
+      if (host.type === 'rope' || host.type === 'elastic') {
+        // 排除滑点自身：否则“把滑点放到新的绳长比例处”会拿包含它自己的
+        // 当前折线做参考，滑点永远停在原位。其余滑点仍保留为绳形节点。
+        const info = this.getRopeDisplayPath(host, point.id);
+        if (!info) return false;
+        const target = this.pointAtPathFraction(info.points, clamp(fraction, 0.01, 0.99));
+        if (!target) return false;
+        this.Body.setPosition(point.proxy, target);
+        return true;
+      }
+      return false;
+    }
+
+    updatePointPositions() {
+      for (const point of this.entities.values()) {
+        if (point.kind !== 'point' || !point.proxy) continue;
+        if (point.pointType !== 'slider' || point.hostKind !== 'connector') continue;
+        const host = this.connectors.get(point.hostId);
+        if (!host) continue;
+        if (host.type === 'rod') {
+          const pA = this.getRefPoint(host.a);
+          const pB = this.getRefPoint(host.b);
+          if (!pA || !pB) continue;
+          const dx = pB.x - pA.x;
+          const dy = pB.y - pA.y;
+          const len2 = dx * dx + dy * dy;
+          if (len2 <= 1e-12) continue;
+          const t = clamp(((point.proxy.position.x - pA.x) * dx + (point.proxy.position.y - pA.y) * dy) / len2, 0, 1);
+          point.param = t;
+          this.Body.setPosition(point.proxy, { x: pA.x + dx * t, y: pA.y + dy * t });
+          const len = Math.sqrt(len2);
+          const dir = { x: dx / len, y: dy / len };
+          const v = point.proxy.velocity;
+          const axial = v.x * dir.x + v.y * dir.y;
+          this.Body.setVelocity(point.proxy, { x: dir.x * axial, y: dir.y * axial });
+        } else if (host.type === 'rope' || host.type === 'elastic') {
+          this.updateRopeSliderParam(point, host);
+        }
+      }
+    }
+
+    updateRopeSliderParam(point, host) {
+      if (!point || !point.proxy || !host) return;
+      const info = this.getRopeDisplayPath(host);
+      if (!info) return;
+      const index = info.entities.findIndex((item) => item.id === point.id);
+      if (index < 0) return;
+      const fraction = info.nodeFractions[index];
+      if (Number.isFinite(fraction)) point.param = clamp(fraction, 0.01, 0.99);
+      // 轻绳滑点在物理上等价于可自由移动的动点，绳长约束会在
+      // solveRopeLength() 中修正它的位置和速度；这里只更新显示参数，
+      // 不能再把速度投影到绳子的切向，否则滑点无法沿法向把绳子拉紧。
+    }
+
+    compensatePointGravity() {
+      const scale = this.engine.gravity.scale || 0.001;
+      for (const point of this.entities.values()) {
+        if (point.kind !== 'point' || !point.proxy || point.proxy.isStatic) continue;
+        this.Body.applyForce(point.proxy, point.proxy.position, {
+          x: 0,
+          y: -point.proxy.mass * this.state.gravity * scale
+        });
+      }
+    }
 
     frame(now) {
       const elapsed = clamp((now - this.lastTime) / 1000, 0, 0.08);
@@ -1524,82 +2428,12 @@
       this.prepareConnectorForces();
       this.Engine.update(this.engine, FIXED_DT_MS);
       this.applyDirectionLocks();
-      this.applyRopeConstraints();
+      this.updatePointPositions();
       this.applyCustomFriction();
       this.state.simTime += FIXED_DT;
       this.updateConnectorStates();
       this.historyTick += 1;
       if (this.historyTick % HISTORY_STRIDE === 0) this.recordHistory();
-    }
-
-    /* ----------------------------------------------------------------------
-       Light rope: an inextensible, one-sided (tension only) constraint.
-       Running it after the solver guarantees it can hold a stretched rope but
-       never push two bodies apart when the rope would be slack.
-       ---------------------------------------------------------------------- */
-
-    applyRopeConstraints() {
-      const ropes = [...this.connectors.values()].filter((conn) => conn.type === 'rope');
-      if (!ropes.length) return;
-      for (let pass = 0; pass < 2; pass += 1) {
-        for (const conn of ropes) {
-          // A fixed-direction anchor behaves like a guide rail (handled above).
-          if (this.getFixedAnchorInfo(conn)) continue;
-          const bodyA = this.getRefBody(conn.a);
-          const bodyB = this.getRefBody(conn.b);
-          const pA = this.getRefPoint(conn.a);
-          const pB = this.getRefPoint(conn.b);
-          if (!pA || !pB) continue;
-          const dx = pB.x - pA.x;
-          const dy = pB.y - pA.y;
-          const span = Math.hypot(dx, dy);
-          if (!(span > 1e-6)) continue;
-          const over = span - conn.length;
-          if (over <= 1e-4) continue;
-
-          const ux = dx / span;
-          const uy = dy / span;
-          const invA = bodyA && !bodyA.isStatic ? bodyA.inverseMass : 0;
-          const invB = bodyB && !bodyB.isStatic ? bodyB.inverseMass : 0;
-          const total = invA + invB;
-          if (total <= 0) continue;
-
-          const moveA = over * (invA / total);
-          const moveB = over * (invB / total);
-          if (moveA > 0) {
-            this.Body.setPosition(bodyA, {
-              x: bodyA.position.x + ux * moveA,
-              y: bodyA.position.y + uy * moveA
-            });
-          }
-          if (moveB > 0) {
-            this.Body.setPosition(bodyB, {
-              x: bodyB.position.x - ux * moveB,
-              y: bodyB.position.y - uy * moveB
-            });
-          }
-
-          const vA = invA > 0 ? this.bodyVelocity(bodyA) : { x: 0, y: 0 };
-          const vB = invB > 0 ? this.bodyVelocity(bodyB) : { x: 0, y: 0 };
-          const rel = (vB.x - vA.x) * ux + (vB.y - vA.y) * uy;
-          if (rel > 0) {
-            // Cancel only the separating velocity; approaching motion is free.
-            const impulse = rel / total;
-            if (invA > 0) {
-              this.Body.setVelocity(bodyA, {
-                x: bodyA.velocity.x + (ux * impulse * invA) / 60,
-                y: bodyA.velocity.y + (uy * impulse * invA) / 60
-              });
-            }
-            if (invB > 0) {
-              this.Body.setVelocity(bodyB, {
-                x: bodyB.velocity.x - (ux * impulse * invB) / 60,
-                y: bodyB.velocity.y - (uy * impulse * invB) / 60
-              });
-            }
-          }
-        }
-      }
     }
 
     /* ----------------------------------------------------------------------
@@ -1757,41 +2591,53 @@
     }
 
     prepareConnectorForces() {
+      this.compensatePointGravity();
       for (const conn of this.connectors.values()) {
-        if (conn.type === 'rod') {
-          if (!conn.constraint) this.syncConnectorConstraint(conn);
-          if (conn.constraint) {
-            conn.constraint.stiffness = 1;
-            conn._state = 'rigid';
-          }
+        if (conn.type === 'rod' || conn.type === 'rope') {
+          // 轻硬杆/轻绳由自定义约束求解，力只在接触端传递。
+          conn._lastForce = 0;
           continue;
         }
-        // A rope is handled as a one-sided distance constraint after the solver
-        // (see applyRopeConstraints) so it can only pull, never push.
-        if (conn.type === 'rope') continue;
+
+        if (conn.type === 'elastic' && conn.sliders && conn.sliders.length) {
+          const nodes = this.getRopePathPoints(conn);
+          if (nodes.length < 2) continue;
+          let span = 0;
+          for (let i = 1; i < nodes.length; i += 1) span += distance(nodes[i - 1], nodes[i]);
+          const raw = Math.max(0, conn.k * (span - conn.restLength));
+          if (raw > 1e-9) {
+            const first = nodes[0];
+            const second = nodes[1];
+            const prev = nodes[nodes.length - 2];
+            const last = nodes[nodes.length - 1];
+            const uA = normalize({ x: second.x - first.x, y: second.y - first.y }, { x: 0, y: 1 });
+            const uB = normalize({ x: prev.x - last.x, y: prev.y - last.y }, { x: 0, y: 1 });
+            this.applyForceAtRef(conn.a, { x: uA.x * raw, y: uA.y * raw });
+            this.applyForceAtRef(conn.b, { x: uB.x * raw, y: uB.y * raw });
+          }
+          conn._lastForce = raw;
+          conn._lastSpan = span;
+          conn._state = span > conn.restLength + 0.002 ? 'stretched' : 'neutral';
+          continue;
+        }
 
         const pA = this.getRefPoint(conn.a);
         const pB = this.getRefPoint(conn.b);
         if (!pA || !pB) continue;
-        const fixed = this.getFixedAnchorInfo(conn);
+        const fixed = this.getFixedInfo(conn);
         if (fixed) {
           const dir = this.ensureLockDir(conn);
           if (!dir) continue;
-          const anchorPos = { x: fixed.anchor.x, y: fixed.anchor.y };
+          const pFixed = this.getRefPoint(fixed.fixedRef);
           const other = this.getRefPoint(fixed.otherRef);
-          if (!other) continue;
-          const extension = dot({ x: other.x - anchorPos.x, y: other.y - anchorPos.y }, dir);
+          if (!pFixed || !other) continue;
+          const extension = dot({ x: other.x - pFixed.x, y: other.y - pFixed.y }, dir);
           const raw = conn.type === 'spring'
             ? conn.k * (extension - conn.restLength)
             : conn.k * Math.max(0, extension - conn.restLength);
-          const otherBody = this.getRefBody(fixed.otherRef);
-          if (otherBody && !otherBody.isStatic) {
-            this.Body.applyForce(otherBody, otherBody.position, {
-              x: -dir.x * raw * FORCE_UNIT,
-              y: -dir.y * raw * FORCE_UNIT
-            });
-          }
-          conn._lastForce = raw;
+          this.applyForceAtRef(fixed.otherRef, { x: -dir.x * raw, y: -dir.y * raw });
+          this.applyForceAtRef(fixed.fixedRef, { x: dir.x * raw, y: dir.y * raw });
+          conn._lastForce = Math.abs(raw);
           conn._lastSpan = Math.abs(extension);
           conn._state = conn.type === 'spring'
             ? (extension > conn.restLength + 0.002 ? 'stretched'
@@ -1808,21 +2654,9 @@
         const raw = conn.type === 'spring'
           ? conn.k * (span - conn.restLength)
           : conn.k * Math.max(0, span - conn.restLength);
-        const bodyA = this.getRefBody(conn.a);
-        const bodyB = this.getRefBody(conn.b);
-        if (bodyA && !bodyA.isStatic) {
-          this.Body.applyForce(bodyA, bodyA.position, {
-            x: ux * raw * FORCE_UNIT,
-            y: uy * raw * FORCE_UNIT
-          });
-        }
-        if (bodyB && !bodyB.isStatic) {
-          this.Body.applyForce(bodyB, bodyB.position, {
-            x: -ux * raw * FORCE_UNIT,
-            y: -uy * raw * FORCE_UNIT
-          });
-        }
-        conn._lastForce = raw;
+        this.applyForceAtRef(conn.a, { x: ux * raw, y: uy * raw });
+        this.applyForceAtRef(conn.b, { x: -ux * raw, y: -uy * raw });
+        conn._lastForce = Math.abs(raw);
         conn._lastSpan = span;
         conn._state = conn.type === 'spring'
           ? (span > conn.restLength + 0.002 ? 'stretched'
@@ -1831,66 +2665,240 @@
       }
     }
 
-    applyDirectionLocks() {
-      for (const conn of this.connectors.values()) {
-        const fixed = this.getFixedAnchorInfo(conn);
-        if (!fixed) continue;
-        const otherEntity = this.getRefEntity(fixed.otherRef);
-        if (!otherEntity || otherEntity.kind === 'anchor' || !otherEntity.body) continue;
-        const body = otherEntity.body;
-        if (body.isStatic) continue;
-        const dir = this.ensureLockDir(conn);
-        if (!dir) continue;
-        const anchorPos = { x: fixed.anchor.x, y: fixed.anchor.y };
-        const p = body.position;
-        const rel = { x: p.x - anchorPos.x, y: p.y - anchorPos.y };
-        const axial = dot(rel, dir);
-        const perp = { x: -dir.y, y: dir.x };
-        let target;
-        let mode = 'project';
-
-        if (conn.type === 'spring' || conn.type === 'elastic') {
-          target = {
-            x: anchorPos.x + dir.x * axial,
-            y: anchorPos.y + dir.y * axial
-          };
-        } else if (conn.type === 'rod') {
-          target = {
-            x: anchorPos.x + dir.x * conn.length,
-            y: anchorPos.y + dir.y * conn.length
-          };
-          mode = 'pin';
-        } else {
-          const limited = clamp(axial, 0, conn.length);
-          target = {
-            x: anchorPos.x + dir.x * limited,
-            y: anchorPos.y + dir.y * limited
-          };
-          mode = 'rope';
+    solveDistance(refA, refB, target, options = {}) {
+      const pA = this.getRefPoint(refA);
+      const pB = this.getRefPoint(refB);
+      if (!pA || !pB) return;
+      const dx = pB.x - pA.x;
+      const dy = pB.y - pA.y;
+      const dist = Math.hypot(dx, dy);
+      const sA = this.getRefSupports(refA);
+      const sB = this.getRefSupports(refB);
+      const invA = sA.invMass;
+      const invB = sB.invMass;
+      const invSum = invA + invB;
+      const ux = dist > 1e-9 ? dx / dist : 0;
+      const uy = dist > 1e-9 ? dy / dist : 1;
+      if (options.maxOnly && dist <= target + 1e-4) return;
+      const corr = dist - target;
+      const sliderA = invA <= 1e-12 ? this.getSliderHostTangent(refA) : null;
+      const sliderB = invB <= 1e-12 ? this.getSliderHostTangent(refB) : null;
+      if (sliderA && !sliderB) {
+        // 这个分支只用于硬杆滑点：滑点只能沿杆的切向移动，切向修正交给滑点，
+        // 法向修正交给另一端。轻绳滑点在 getRefSupports() 中按自由动点处理，
+        // 由 solveRopeLength() 的总长约束负责，不会进入这里。
+        const along = ux * sliderA.x + uy * sliderA.y;
+        this.nudgeSliderAlongHost(refA, {
+          x: sliderA.x * corr * along,
+          y: sliderA.y * corr * along
+        });
+        const residual = corr * (1 - along * along);
+        this.translateRef(refB, { x: -ux * residual, y: -uy * residual });
+      } else if (sliderB && !sliderA) {
+        const along = ux * sliderB.x + uy * sliderB.y;
+        this.nudgeSliderAlongHost(refB, {
+          x: -sliderB.x * corr * along,
+          y: -sliderB.y * corr * along
+        });
+        const residual = corr * (1 - along * along);
+        this.translateRef(refA, { x: ux * residual, y: uy * residual });
+      } else if (sliderA && sliderB) {
+        const alongA = ux * sliderA.x + uy * sliderA.y;
+        const alongB = ux * sliderB.x + uy * sliderB.y;
+        const norm = alongA * alongA + alongB * alongB;
+        if (norm > 1e-9) {
+          const shareA = corr * alongA / norm;
+          const shareB = corr * alongB / norm;
+          this.nudgeSliderAlongHost(refA, {
+            x: sliderA.x * shareA,
+            y: sliderA.y * shareA
+          });
+          this.nudgeSliderAlongHost(refB, {
+            x: -sliderB.x * shareB,
+            y: -sliderB.y * shareB
+          });
         }
-
-        if (Math.abs(target.x - p.x) > 1e-7 || Math.abs(target.y - p.y) > 1e-7) {
-          this.Body.setPosition(body, target);
-        }
-
-        let vx = body.velocity.x;
-        let vy = body.velocity.y;
-        if (mode === 'pin') {
-          vx = 0;
-          vy = 0;
-        } else {
-          const vLat = vx * perp.x + vy * perp.y;
-          vx -= perp.x * vLat;
-          vy -= perp.y * vLat;
-          if (mode === 'rope') {
-            let vAx = vx * dir.x + vy * dir.y;
-            if (axial >= conn.length - 1e-4 && vAx > 0) vAx = 0;
-            if (axial <= 1e-4 && vAx < 0) vAx = 0;
-            vx = dir.x * vAx;
-            vy = dir.y * vAx;
+      } else if (invSum > 1e-12) {
+        this.translateRef(refA, { x: ux * corr * invA / invSum, y: uy * corr * invA / invSum });
+        this.translateRef(refB, { x: -ux * corr * invB / invSum, y: -uy * corr * invB / invSum });
+      }
+      if (invSum > 1e-12 || sliderA || sliderB) {
+        const vA = this.getRefVelocity(refA);
+        const vB = this.getRefVelocity(refB);
+        const rel = (vB.x - vA.x) * ux + (vB.y - vA.y) * uy;
+        if (Number.isFinite(rel) && !(options.maxOnly && rel <= 0)) {
+          if (sliderA && !sliderB) {
+            const along = ux * sliderA.x + uy * sliderA.y;
+            this.nudgeSliderVelocityAlongHost(refA, {
+              x: sliderA.x * rel * along,
+              y: sliderA.y * rel * along
+            });
+            const residual = rel * (1 - along * along);
+            this.applyRefVelocityDelta(refB, { x: -ux * residual, y: -uy * residual });
+          } else if (sliderB && !sliderA) {
+            const along = ux * sliderB.x + uy * sliderB.y;
+            this.nudgeSliderVelocityAlongHost(refB, {
+              x: -sliderB.x * rel * along,
+              y: -sliderB.y * rel * along
+            });
+            const residual = rel * (1 - along * along);
+            this.applyRefVelocityDelta(refA, { x: ux * residual, y: uy * residual });
+          } else if (sliderA && sliderB) {
+            const alongA = ux * sliderA.x + uy * sliderA.y;
+            const alongB = ux * sliderB.x + uy * sliderB.y;
+            const norm = alongA * alongA + alongB * alongB;
+            if (norm > 1e-9) {
+              const shareA = rel * alongA / norm;
+              const shareB = rel * alongB / norm;
+              this.nudgeSliderVelocityAlongHost(refA, {
+                x: sliderA.x * shareA,
+                y: sliderA.y * shareA
+              });
+              this.nudgeSliderVelocityAlongHost(refB, {
+                x: -sliderB.x * shareB,
+                y: -sliderB.y * shareB
+              });
+            }
+          } else {
+            const impulse = rel / invSum;
+            this.applyRefVelocityDelta(refA, { x: ux * impulse * invA, y: uy * impulse * invA });
+            this.applyRefVelocityDelta(refB, { x: -ux * impulse * invB, y: -uy * impulse * invB });
           }
         }
-        this.Body.setVelocity(body, { x: vx, y: vy });
+      }
+    }
+
+    solveRopeLength(conn) {
+      const nodes = this.getRopePathEntities(conn);
+      if (nodes.length < 2) return;
+      const refs = nodes.map((entity) => this.refFor(entity));
+      const target = Math.max(1e-4, conn.length);
+
+      // 轻绳的总长约束：对所有节点一起做加权投影。滑点/动点也是绳上的
+      // 节点，因此重物把滑点向下拉时，整个折线会一起调整，直到总长回到
+      // conn.length；而不是只把某一段按比例缩短、把法向误差丢给固定的端点。
+      for (let pass = 0; pass < 5; pass += 1) {
+        const points = refs.map((ref) => this.getRefPoint(ref));
+        if (points.some((point) => !point)) return;
+        const gradients = points.map(() => ({ x: 0, y: 0 }));
+        let total = 0;
+        for (let i = 1; i < points.length; i += 1) {
+          const dx = points[i].x - points[i - 1].x;
+          const dy = points[i].y - points[i - 1].y;
+          const len = Math.hypot(dx, dy);
+          total += len;
+          if (len <= 1e-9) continue;
+          const ux = dx / len;
+          const uy = dy / len;
+          // ∂|p_i - p_{i-1}| / ∂p_{i-1} = -u，∂/∂p_i = u。
+          gradients[i - 1].x -= ux;
+          gradients[i - 1].y -= uy;
+          gradients[i].x += ux;
+          gradients[i].y += uy;
+        }
+        if (total <= target + 1e-4) break;
+
+        const supports = refs.map((ref) => this.getRefSupports(ref));
+        let denominator = 0;
+        for (let i = 0; i < refs.length; i += 1) {
+          const invMass = supports[i].invMass;
+          if (invMass <= 1e-12) continue;
+          denominator += invMass * (gradients[i].x * gradients[i].x + gradients[i].y * gradients[i].y);
+        }
+        if (denominator <= 1e-12) break;
+
+        const correction = total - target;
+        for (let i = 0; i < refs.length; i += 1) {
+          const invMass = supports[i].invMass;
+          if (invMass <= 1e-12) continue;
+          const scale = correction * invMass / denominator;
+          this.translateRef(refs[i], {
+            x: -gradients[i].x * scale,
+            y: -gradients[i].y * scale
+          });
+        }
+      }
+
+      // 绷紧的绳也不能继续获得“拉长方向”的速度；否则下一帧仍会先被拉长
+      // 再由位置投影拉回，表现为肉眼可见的弹性抖动。
+      const points = refs.map((ref) => this.getRefPoint(ref));
+      if (points.some((point) => !point)) return;
+      let total = 0;
+      const gradients = points.map(() => ({ x: 0, y: 0 }));
+      for (let i = 1; i < points.length; i += 1) {
+        const dx = points[i].x - points[i - 1].x;
+        const dy = points[i].y - points[i - 1].y;
+        const len = Math.hypot(dx, dy);
+        total += len;
+        if (len <= 1e-9) continue;
+        const ux = dx / len;
+        const uy = dy / len;
+        gradients[i - 1].x -= ux;
+        gradients[i - 1].y -= uy;
+        gradients[i].x += ux;
+        gradients[i].y += uy;
+      }
+      if (total < target - 5e-4) return;
+
+      const supports = refs.map((ref) => this.getRefSupports(ref));
+      let denominator = 0;
+      for (let i = 0; i < refs.length; i += 1) {
+        const invMass = supports[i].invMass;
+        if (invMass <= 1e-12) continue;
+        denominator += invMass * (gradients[i].x * gradients[i].x + gradients[i].y * gradients[i].y);
+      }
+      if (denominator <= 1e-12) return;
+
+      let rate = 0;
+      for (let i = 0; i < refs.length; i += 1) {
+        if (supports[i].invMass <= 1e-12) continue;
+        const velocity = this.getRefVelocity(refs[i]);
+        rate += gradients[i].x * velocity.x + gradients[i].y * velocity.y;
+      }
+      if (rate <= 1e-9) return;
+      const scale = rate / denominator;
+      for (let i = 0; i < refs.length; i += 1) {
+        const invMass = supports[i].invMass;
+        if (invMass <= 1e-12) continue;
+        this.applyRefVelocityDelta(refs[i], {
+          x: -gradients[i].x * scale * invMass,
+          y: -gradients[i].y * scale * invMass
+        });
+      }
+    }
+
+    solveFixedDirection(conn) {
+      const fixed = this.getFixedInfo(conn);
+      if (!fixed) return;
+      const dir = this.ensureLockDir(conn);
+      if (!dir) return;
+      const pFixed = this.getRefPoint(fixed.fixedRef);
+      const pOther = this.getRefPoint(fixed.otherRef);
+      if (!pFixed || !pOther) return;
+      const rel = { x: pOther.x - pFixed.x, y: pOther.y - pFixed.y };
+      const perp = { x: -dir.y, y: dir.x };
+      const perpError = dot(rel, perp);
+      this.applyPairPositionCorrection(fixed.fixedRef, fixed.otherRef, perp, perpError);
+      this.applyPairVelocityCorrection(fixed.fixedRef, fixed.otherRef, perp);
+      if (conn.type !== 'rod') return;
+      const axial = dot(rel, dir);
+      this.applyPairPositionCorrection(fixed.fixedRef, fixed.otherRef, dir, axial - conn.length);
+      this.applyPairVelocityCorrection(fixed.fixedRef, fixed.otherRef, dir);
+    }
+
+    applyDirectionLocks() {
+      for (let pass = 0; pass < 3; pass += 1) {
+        for (const conn of this.connectors.values()) {
+          if (conn.type === 'rod') {
+            const fixed = this.getFixedInfo(conn);
+            if (fixed) this.solveFixedDirection(conn);
+            else this.solveDistance(conn.a, conn.b, conn.length);
+          } else if (conn.type === 'rope') {
+            this.solveRopeLength(conn);
+          } else if (conn.type === 'spring') {
+            this.solveFixedDirection(conn);
+          }
+        }
       }
     }
 
@@ -2198,7 +3206,7 @@
       return `
         ${this.panelHeader('OBJECTS / 01', '物体')}
         <section class="panel-section">
-          <h3 class="section-title">添加物体 <span class="section-count">3 TYPES</span></h3>
+          <h3 class="section-title">添加物体 <span class="section-count">5 TYPES</span></h3>
           <div class="add-grid">
             <button type="button" class="add-card" data-action="add-block">
               <span class="add-icon">${ICONS.block}</span>
@@ -2211,6 +3219,14 @@
             <button type="button" class="add-card" data-action="add-anchor">
               <span class="add-icon">${ICONS.anchor}</span>
               <span><strong>锚点</strong><small>固定连接点</small></span>
+            </button>
+            <button type="button" class="add-card" data-action="add-dynamic-point">
+              <span class="add-icon">${ICONS.dynamicPoint}</span>
+              <span><strong>动点</strong><small>依附物体/连接件</small></span>
+            </button>
+            <button type="button" class="add-card" data-action="add-slider-point">
+              <span class="add-icon">${ICONS.sliderPoint}</span>
+              <span><strong>滑点</strong><small>沿杆或绳滑动</small></span>
             </button>
           </div>
         </section>
@@ -2234,10 +3250,26 @@
         const angle = Math.atan2(entity.height, entity.base) * 180 / Math.PI;
         meta = `${formatMass(entity.mass)} · 底 ${entity.base.toFixed(2)} m · ${angle.toFixed(1)}° · μ ${entity.friction.toFixed(2)}`;
         icon = ICONS.incline;
+      } else if (entity.kind === 'point') {
+        const host = entity.hostKind === 'entity'
+          ? this.entities.get(entity.hostId)
+          : entity.hostKind === 'connector'
+            ? this.connectors.get(entity.hostId)
+            : null;
+        const hostName = host ? host.name : (entity.hostKind === 'split' ? '连接件节点' : '—');
+        const param = Number.isFinite(entity.param) ? ` · ${(entity.param * 100).toFixed(0)}%` : '';
+        const isSplit = entity._split || entity.hostKind === 'split';
+        meta = isSplit
+          ? `拆分结点 · ${hostName} · 无质量`
+          : entity.pointType === 'slider'
+            ? `滑点 · ${hostName}${param} · 无质量`
+            : `动点 · ${hostName}${param} · 无质量`;
+        icon = entity.pointType === 'slider' ? ICONS.sliderPoint : ICONS.dynamicPoint;
       } else {
-        meta = `X ${formatCoord(entity.x)} m · H ${formatCoord(-entity.y)} m · ${entity.fixedDirection ? '方向锁定' : '光滑转轴'}`;
+        meta = `X ${formatCoord(entity.x)} m · H ${formatCoord(-entity.y)} m · 光滑转轴`;
         icon = ICONS.anchor;
       }
+      const lockable = entity.kind !== 'anchor' && entity.kind !== 'point';
       return `
         <div class="list-row ${selected ? 'is-selected' : ''} ${entity.locked ? 'is-locked' : ''}" data-select-id="${entity.id}">
           <div class="list-glyph">${icon}</div>
@@ -2245,12 +3277,12 @@
             <div class="list-title">${entity.name}${entity.locked ? '<span class="lock-tag">锁定</span>' : ''}</div>
             <div class="list-meta">${meta}</div>
           </div>
-          ${entity.kind === 'anchor' ? '' : `
+          ${lockable ? `
             <button type="button" class="row-lock ${entity.locked ? 'is-on' : ''}"
               data-action="toggle-lock-row" data-lock-id="${entity.id}"
               aria-label="${entity.locked ? '解锁' : '锁定'}${entity.name}"
               title="${entity.locked ? '解除锁定' : '锁定位置'}">${entity.locked ? ICONS.lock : ICONS.unlocked}</button>
-          `}
+          ` : ''}
           <button type="button" class="row-del" data-action="delete-row" data-delete-id="${entity.id}"
             aria-label="删除${entity.name}">${ICONS.trash}</button>
         </div>
@@ -2258,7 +3290,7 @@
     }
 
     lockToggleHTML(entity) {
-      if (!entity || entity.kind === 'anchor') return '';
+      if (!entity || entity.kind === 'anchor' || entity.kind === 'point') return '';
       return `
         <div class="toggle-row">
           <div class="toggle-copy">
@@ -2274,9 +3306,16 @@
 
     entityInspectorHTML(entity) {
       const typeLabel = entity.kind === 'block' ? 'BLOCK / 物块'
-        : entity.kind === 'incline' ? 'INCLINE / 斜面' : 'ANCHOR / 锚点';
+        : entity.kind === 'incline' ? 'INCLINE / 斜面'
+          : entity.kind === 'point'
+            ? (entity._split || entity.hostKind === 'split'
+              ? 'SPLIT POINT / 拆分结点'
+              : entity.pointType === 'slider' ? 'SLIDER POINT / 滑点' : 'DYNAMIC POINT / 动点')
+            : 'ANCHOR / 锚点';
       const icon = entity.kind === 'block' ? ICONS.block
-        : entity.kind === 'incline' ? ICONS.incline : ICONS.anchor;
+        : entity.kind === 'incline' ? ICONS.incline
+          : entity.kind === 'point' ? (entity.pointType === 'slider' ? ICONS.sliderPoint : ICONS.dynamicPoint)
+            : ICONS.anchor;
       let body = '';
 
       if (entity.kind === 'block') {
@@ -2361,6 +3400,35 @@
           })}
           <div class="notice">改变角度时底边固定、只改变高度；修改形状会清空该斜面的速度。</div>
         `;
+      } else if (entity.kind === 'point') {
+        const world = this.getRefPoint(this.refFor(entity)) || { x: 0, y: 0 };
+        const host = entity.hostKind === 'entity'
+          ? this.entities.get(entity.hostId)
+          : entity.hostKind === 'connector'
+            ? this.connectors.get(entity.hostId)
+            : null;
+        const hostName = host ? host.name : (entity.hostKind === 'split' ? '连接件拆分节点' : '自由点');
+        const attached = this.getAttachedConnectors(entity.id).length;
+        const isSplit = entity._split || entity.hostKind === 'split';
+        const kindLabel = isSplit
+          ? '拆分结点（连接两段连接件）'
+          : entity.pointType === 'slider' ? '滑点（无摩擦）' : '动点（随附着物运动）';
+        body = `
+          <div class="info-grid">
+            <div class="info-cell"><span>位置 X</span><strong data-live="anchor-x">${formatCoord(world.x)} <small>m</small></strong></div>
+            <div class="info-cell"><span>离地高度</span><strong data-live="anchor-y">${formatCoord(-world.y)} <small>m</small></strong></div>
+            <div class="info-cell"><span>连接件</span><strong data-live="anchor-links">${attached} <small>个</small></strong></div>
+            <div class="info-cell"><span>依附</span><strong>${hostName}</strong></div>
+          </div>
+          <div class="field-gap"></div>
+          ${!isSplit && Number.isFinite(entity.param) ? this.fieldHTML({
+            field: 'point-param', label: '沿连接件位置', value: entity.param * 100,
+            min: 0, max: 100, step: 1, unit: '%',
+            display: `${(entity.param * 100).toFixed(0)}%`,
+            hint: entity.pointType === 'slider' ? '滑点可沿轻绳/硬杆自由滑动。' : '动点固定在连接件上的相对位置。'
+          }) : ''}
+          <div class="notice">${kindLabel}。${isSplit ? '结点位于两段连接件之间，可继续连接其他物体。' : '动点/滑点无质量，不作为受力分析对象；可连接弹簧、轻绳、硬杆或在受力求中使用。'}</div>
+        `;
       } else {
         const attached = this.getAttachedConnectors(entity.id).length;
         body = `
@@ -2368,18 +3436,9 @@
             <div class="info-cell"><span>位置 X</span><strong data-live="anchor-x">${formatCoord(entity.x)} <small>m</small></strong></div>
             <div class="info-cell"><span>离地高度</span><strong data-live="anchor-y">${formatCoord(-entity.y)} <small>m</small></strong></div>
             <div class="info-cell"><span>连接件</span><strong data-live="anchor-links">${attached} <small>个</small></strong></div>
-            <div class="info-cell"><span>类型</span><strong>${entity.fixedDirection ? '方向锁定' : '光滑转轴'}</strong></div>
+            <div class="info-cell"><span>类型</span><strong>光滑转轴</strong></div>
           </div>
-          <div class="toggle-row">
-            <div class="toggle-copy">
-              <strong>固定连接方向</strong>
-              <small>开启后，连接件只能沿当前方向伸缩；关闭时为光滑转轴。</small>
-            </div>
-            <button type="button" class="toggle ${entity.fixedDirection ? 'is-on' : ''}"
-              data-action="toggle-anchor-fixed" aria-pressed="${entity.fixedDirection ? 'true' : 'false'}"
-              aria-label="固定连接方向"></button>
-          </div>
-          <div class="notice">锚点不参与碰撞，也不是有质量的物体。编辑模式下可直接拖动锚点。</div>
+          <div class="notice">锚点不参与碰撞，也不是有质量的物体。固定方向请在硬杆或弹簧的属性中按端点设置。编辑模式下可直接拖动锚点。</div>
         `;
       }
 
@@ -2483,7 +3542,7 @@
       const pB = this.getRefPoint(conn.b);
       const span = pA && pB ? distance(pA, pB) : 0;
       const force = pA && pB ? this.connectorForce(conn, pA, pB).magnitude : 0;
-      const fixed = this.getFixedAnchorInfo(conn);
+      const fixed = this.getFixedInfo(conn);
       let fields = '';
 
       if (conn.type === 'spring' || conn.type === 'elastic') {
@@ -2509,6 +3568,26 @@
         ? `${formatForce(Math.abs(force))} <small>N</small>`
         : '—';
       const state = this.connectorStateLabel(conn);
+      const fixedControls = (conn.type === 'rod' || conn.type === 'spring') ? `
+        <div class="toggle-row">
+          <div class="toggle-copy">
+            <strong>固定端点 A 方向</strong>
+            <small>${this.getRefName(conn.a)}：锁定当前朝向，连接件不再绕此端点转动。</small>
+          </div>
+          <button type="button" class="toggle ${conn.fixedA ? 'is-on' : ''}"
+            data-action="toggle-connector-fixed" data-end="a"
+            aria-pressed="${conn.fixedA ? 'true' : 'false'}" aria-label="固定端点 A 方向"></button>
+        </div>
+        <div class="toggle-row">
+          <div class="toggle-copy">
+            <strong>固定端点 B 方向</strong>
+            <small>${this.getRefName(conn.b)}：锁定当前朝向，连接件不再绕此端点转动。</small>
+          </div>
+          <button type="button" class="toggle ${conn.fixedB ? 'is-on' : ''}"
+            data-action="toggle-connector-fixed" data-end="b"
+            aria-pressed="${conn.fixedB ? 'true' : 'false'}" aria-label="固定端点 B 方向"></button>
+        </div>
+      ` : '';
 
       return `
         <section class="panel-section inspector">
@@ -2537,7 +3616,8 @@
           </div>
           <div class="field-gap"></div>
           ${fields}
-          ${fixed ? `<div class="notice accent">此连接件的一端锚点已固定方向。它只能沿当前方向伸缩或绕固定方向运动；拖动锚点可重新确定方向。</div>` : ''}
+          ${fixedControls}
+          ${fixed ? `<div class="notice accent">${fixed.end === 'a' ? '端点 A' : '端点 B'} 已固定方向：连接件不能绕该端点转动，${conn.type === 'rod' ? '另一端保持杆长随动' : '另一端只能沿锁定方向伸缩'}。拖动该端点可重新确定方向。</div>` : ''}
           ${conn.type === 'rope' ? '<div class="notice">轻绳只能承受拉力：松弛时没有约束力，拉直后才限制长度。</div>' : ''}
           ${conn.type === 'elastic' ? '<div class="notice">弹性绳只能承受拉力：长度小于原长时没有弹力。</div>' : ''}
           ${conn.type === 'rod' ? '<div class="notice">轻硬杆长度不可改变，既能受拉也能受压。</div>' : ''}
@@ -3218,6 +4298,7 @@
       if (field === 'friction' || field === 'groundFriction') return value.toFixed(2);
       if (field === 'gravity') return `${value.toFixed(1)} m/s²`;
       if (field === 'k') return `${value.toFixed(1)} N/m`;
+      if (field === 'point-param') return `${value.toFixed(0)}%`;
       return `${formatNumber(value)} m`;
     }
 
@@ -3351,6 +4432,19 @@
         return entity.friction;
       }
 
+      if (entity.kind === 'point' && field === 'point-param') {
+        if (entity._split || entity.hostKind === 'split') return null;
+        const isSlider = entity.pointType === 'slider' && entity.hostKind === 'connector';
+        entity.param = clamp(value / 100, isSlider ? 0.01 : 0, isSlider ? 0.99 : 1);
+        if (isSlider && entity.proxy) {
+          const host = this.connectors.get(entity.hostId);
+          if (host) this.positionSliderAtFraction(entity, host, entity.param);
+        }
+        this.updatePointPositions();
+        this.updateLiveReadouts(true);
+        return entity.param * 100;
+      }
+
       if (entity.kind === 'block') {
         if (field !== 'width' && field !== 'height') return null;
         entity[field] = clamp(value, 0.1, 5);
@@ -3418,6 +4512,12 @@
         case 'add-anchor':
           this.addAnchorInteractive();
           break;
+        case 'add-dynamic-point':
+          this.startPointPlacement('dynamic');
+          break;
+        case 'add-slider-point':
+          this.startPointPlacement('slider');
+          break;
         case 'pick-connector':
           this.startConnectorPick(element.dataset.type);
           break;
@@ -3449,24 +4549,27 @@
           this.renderPanel(true);
           break;
         }
-        case 'toggle-anchor-fixed': {
-          const entity = this.selectedEntity();
-          if (!entity || entity.kind !== 'anchor') break;
-          this.setAnchorFixed(entity, !entity.fixedDirection);
+        case 'toggle-connector-fixed': {
+          const conn = this.connectors.get(this.state.selectedId);
+          if (!conn || (conn.type !== 'rod' && conn.type !== 'spring')) break;
+          const end = element.dataset.end === 'b' ? 'b' : 'a';
+          const next = end === 'b' ? !conn.fixedB : !conn.fixedA;
+          this.pauseForEditing();
+          this.setConnectorFixedEnd(conn, end, next);
           this.renderPanel(true);
-          this.updateLiveReadouts(true);
+          this.toast(next ? `已固定端点 ${end.toUpperCase()} 的方向` : `端点 ${end.toUpperCase()} 已恢复为光滑转轴`);
           break;
         }
         case 'toggle-lock': {
           const entity = this.selectedEntity();
-          if (!entity || entity.kind === 'anchor') break;
+          if (!entity || entity.kind === 'anchor' || entity.kind === 'point') break;
           this.setEntityLocked(entity, !entity.locked);
           this.toast(entity.locked ? `${entity.name} 已锁定` : `${entity.name} 已解锁`);
           break;
         }
         case 'toggle-lock-row': {
           const entity = this.entities.get(element.dataset.lockId);
-          if (!entity || entity.kind === 'anchor') break;
+          if (!entity || entity.kind === 'anchor' || entity.kind === 'point') break;
           this.setEntityLocked(entity, !entity.locked);
           this.updateLiveReadouts(true);
           break;
@@ -3517,9 +4620,12 @@
       this.updateForceTable();
       const entity = this.selectedEntity();
       if (entity) {
-        if (entity.kind === 'anchor') {
-          this.setLive('anchor-x', `${formatCoord(entity.x)} <small>m</small>`);
-          this.setLive('anchor-y', `${formatCoord(-entity.y)} <small>m</small>`);
+        if (entity.kind === 'anchor' || entity.kind === 'point') {
+          const world = entity.kind === 'point'
+            ? (this.getRefPoint(this.refFor(entity)) || { x: 0, y: 0 })
+            : { x: entity.x, y: entity.y };
+          this.setLive('anchor-x', `${formatCoord(world.x)} <small>m</small>`);
+          this.setLive('anchor-y', `${formatCoord(-world.y)} <small>m</small>`);
           const attached = this.getAttachedConnectors(entity.id).length;
           this.setLive('anchor-links', `${attached} <small>个</small>`);
           return;
@@ -3683,6 +4789,17 @@
         return;
       }
 
+      if (this.state.pendingPoint) {
+        const slider = this.state.pendingPoint.pointType === 'slider';
+        const hostHit = this.hitTestPointHost(p.x, p.y);
+        const normalHit = this.hitTest(p.x, p.y);
+        const hit = slider
+          ? hostHit
+          : (hostHit && (!normalHit || normalHit.type === 'connector') ? hostHit : normalHit);
+        this.handlePointPlacement(hit);
+        return;
+      }
+
       const hit = this.hitTest(p.x, p.y);
       this.pointer.down = true;
 
@@ -3700,23 +4817,36 @@
         }
       }
 
-      if (this.state.mode === 'edit' && hit && (hit.type === 'anchor' || hit.type === 'body')) {
+      if (this.state.mode === 'edit' && hit && (hit.type === 'anchor' || hit.type === 'body' || hit.type === 'point')) {
         const entity = this.entities.get(hit.id);
         if (entity) {
           this.pauseForEditing();
           const world = this.screenToWorld(p.x, p.y);
-          const offset = entity.kind === 'anchor'
-            ? { x: world.x - entity.x, y: world.y - entity.y }
-            : { x: world.x - entity.body.position.x, y: world.y - entity.body.position.y };
-          this.drag = {
-            kind: 'entity',
-            id: entity.id,
-            entity,
-            startX: p.x,
-            startY: p.y,
-            offset,
-            moved: false
-          };
+          if (entity.kind === 'point') {
+            const ref = this.getRefPoint(this.refFor(entity)) || world;
+            this.drag = {
+              kind: 'point',
+              id: entity.id,
+              entity,
+              startX: p.x,
+              startY: p.y,
+              offset: { x: world.x - ref.x, y: world.y - ref.y },
+              moved: false
+            };
+          } else {
+            const offset = entity.kind === 'anchor'
+              ? { x: world.x - entity.x, y: world.y - entity.y }
+              : { x: world.x - entity.body.position.x, y: world.y - entity.body.position.y };
+            this.drag = {
+              kind: 'entity',
+              id: entity.id,
+              entity,
+              startX: p.x,
+              startY: p.y,
+              offset,
+              moved: false
+            };
+          }
           this.select(entity.id, { openPanel: false });
           try { this.canvas.setPointerCapture(event.pointerId); } catch (error) { /* synthetic events */ }
           this.canvas.classList.add('is-movable');
@@ -3780,6 +4910,14 @@
             this.refreshLocksAround(entity.id);
           }
           this.updateLiveReadouts(true);
+        } else if (this.drag.kind === 'point' && this.drag.moved) {
+          const world = this.screenToWorld(p.x, p.y);
+          this.movePointTo(this.drag.entity, {
+            x: world.x - this.drag.offset.x,
+            y: world.y - this.drag.offset.y
+          });
+          this.refreshLocksAround(this.drag.entity.id);
+          this.updateLiveReadouts(true);
         } else if (this.drag.kind === 'pan') {
           const scale = PPU * this.camera.zoom;
           this.camera.x = this.drag.camX - dx / scale;
@@ -3789,9 +4927,15 @@
       }
 
       const hit = this.hitTest(p.x, p.y);
-      this.hoverId = hit ? hit.id : null;
+      const hostHit = this.state.pendingPoint ? this.hitTestPointHost(p.x, p.y) : null;
+      const preferHost = hostHit && (
+        this.state.pendingPoint.pointType === 'slider'
+        || !hit
+        || hit.type === 'connector'
+      );
+      this.hoverId = preferHost ? hostHit.id : (hit ? hit.id : null);
       this.canvas.classList.remove('is-pullable');
-      if (this.state.mode === 'edit' && hit && (hit.type === 'anchor' || hit.type === 'body')) {
+      if (this.state.mode === 'edit' && hit && (hit.type === 'anchor' || hit.type === 'body' || hit.type === 'point')) {
         this.canvas.classList.add('is-movable');
       } else {
         this.canvas.classList.remove('is-movable');
@@ -3833,6 +4977,11 @@
         this.refreshLocksAround(drag.entity.id);
         this.select(drag.entity.id, { openPanel: true });
         this.toast('位置已更新');
+      } else if (drag.kind === 'point' && drag.moved) {
+        this.updateHome(drag.entity);
+        this.refreshLocksAround(drag.entity.id);
+        this.select(drag.entity.id, { openPanel: true });
+        this.toast('点位置已更新');
       } else if (!drag.moved) {
         const hit = this.hitTest(p.x, p.y);
         if (hit) {
@@ -3845,7 +4994,7 @@
       this.canvas.classList.remove('is-movable');
       this.canvas.classList.remove('is-pullable');
       const hit = this.hitTest(p.x, p.y);
-      if (this.state.mode === 'edit' && hit && (hit.type === 'anchor' || hit.type === 'body')) {
+      if (this.state.mode === 'edit' && hit && (hit.type === 'anchor' || hit.type === 'body' || hit.type === 'point')) {
         this.canvas.classList.add('is-movable');
       } else if (this.state.mode === 'physics' && hit && hit.type === 'body') {
         const entity = this.entities.get(hit.id);
@@ -3866,7 +5015,17 @@
       }
 
       for (const entity of entities) {
-        if (entity.kind === 'anchor' || !entity.body) continue;
+        if (entity.kind !== 'point') continue;
+        const world = this.getRefPoint(this.refFor(entity));
+        if (!world) continue;
+        const p = this.worldToScreen(world.x, world.y);
+        if (Math.hypot(p.x - screenX, p.y - screenY) <= 11) {
+          return { type: 'point', id: entity.id, entity };
+        }
+      }
+
+      for (const entity of entities) {
+        if (entity.kind === 'anchor' || entity.kind === 'point' || !entity.body) continue;
         const polygon = entity.body.vertices.map((v) => this.worldToScreen(v.x, v.y));
         if (pointInPolygon(point, polygon)) {
           return { type: 'body', id: entity.id, entity };
@@ -3876,17 +5035,69 @@
       if (!forConnectorPick) {
         const conns = [...this.connectors.values()].reverse();
         for (const conn of conns) {
-          const pA = this.getRefPoint(conn.a);
-          const pB = this.getRefPoint(conn.b);
-          if (!pA || !pB) continue;
-          const a = this.worldToScreen(pA.x, pA.y);
-          const b = this.worldToScreen(pB.x, pB.y);
-          if (pointSegmentDistance(point, a, b) <= 8) {
-            return { type: 'connector', id: conn.id, conn };
-          }
+          if (this.hitConnectorPath(conn, point)) return { type: 'connector', id: conn.id, conn };
         }
       }
       return null;
+    }
+
+    hitConnectorPath(conn, screenPoint, tolerance = 8) {
+      const distanceToPath = this.connectorScreenDistance(conn, screenPoint);
+      return Number.isFinite(distanceToPath) && distanceToPath <= tolerance;
+    }
+
+    connectorScreenDistance(conn, screenPoint) {
+      if (!conn || !screenPoint) return Infinity;
+      const worlds = (conn.type === 'rope' || conn.type === 'elastic')
+        ? (this.getRopeDisplayPath(conn)?.points || this.getRopePathPoints(conn))
+        : [this.getRefPoint(conn.a), this.getRefPoint(conn.b)];
+      const pts = worlds.filter(Boolean).map((p) => this.worldToScreen(p.x, p.y));
+      let best = Infinity;
+      for (let i = 1; i < pts.length; i += 1) {
+        best = Math.min(best, pointSegmentDistance(screenPoint, pts[i - 1], pts[i]));
+      }
+      return best;
+    }
+
+    hitTestConnector(screenX, screenY) {
+      const point = { x: screenX, y: screenY };
+      let best = null;
+      let bestDistance = 14;
+      for (const conn of this.connectors.values()) {
+        const d = this.connectorScreenDistance(conn, point);
+        if (d < bestDistance) {
+          bestDistance = d;
+          best = { type: 'connector', id: conn.id, conn };
+        }
+      }
+      return best;
+    }
+
+    /**
+     * 放置动点/滑点时额外使用更宽的命中范围，并优先返回连接件。
+     * 普通选择仍使用原来的 8px 命中范围，避免动不动就选中连接件。
+     */
+    hitTestPointHost(screenX, screenY) {
+      const pending = this.state.pendingPoint;
+      if (!pending) return null;
+      const sliderOnly = pending.pointType === 'slider';
+      const point = { x: screenX, y: screenY };
+      let best = null;
+      let bestDistance = sliderOnly ? 18 : 16;
+      for (const conn of this.connectors.values()) {
+        if (sliderOnly && conn.type !== 'rod' && conn.type !== 'rope') continue;
+        if (!sliderOnly
+          && conn.type !== 'rod'
+          && conn.type !== 'rope'
+          && conn.type !== 'elastic'
+          && conn.type !== 'spring') continue;
+        const d = this.connectorScreenDistance(conn, point);
+        if (d <= bestDistance) {
+          bestDistance = d;
+          best = { type: 'connector', id: conn.id, conn, distance: d };
+        }
+      }
+      return best;
     }
 
     /* ======================================================================
@@ -3908,6 +5119,7 @@
       this.drawConnectors();
       this.drawEntities();
       this.drawAnchors();
+      this.drawPoints();
       this.drawVectors();
       this.drawEntityLabels();
       this.drawPendingOverlay();
@@ -4087,14 +5299,16 @@
     connectorPath(conn, pA, pB, selected) {
       const ctx = this.ctx;
       const len = Math.hypot(pB.x - pA.x, pB.y - pA.y);
-      if (len < 1) {
+      const hasRopePath = (conn.type === 'rope' || conn.type === 'elastic')
+        && Array.isArray(conn.sliders) && conn.sliders.length > 0;
+      if (len < 1 && !hasRopePath) {
         ctx.beginPath();
         ctx.arc(pA.x, pA.y, 2, 0, Math.PI * 2);
         ctx.stroke();
         return;
       }
-      const ux = (pB.x - pA.x) / len;
-      const uy = (pB.y - pA.y) / len;
+      const ux = len > 1e-9 ? (pB.x - pA.x) / len : 0;
+      const uy = len > 1e-9 ? (pB.y - pA.y) / len : 1;
       const px = -uy;
       const py = ux;
       const zoom = this.camera.zoom;
@@ -4122,31 +5336,29 @@
       }
 
       if (conn.type === 'elastic') {
-        const amp = Math.min(3.4, 1.5 + zoom * 1.1) * (selected ? 1.2 : 1);
-        const segments = Math.max(24, Math.min(80, Math.round(len / 4)));
+        const info = this.getRopeDisplayPath(conn);
+        const worlds = info ? info.points : [pA, pB];
+        const pts = worlds.map((p) => this.worldToScreen(p.x, p.y));
+        ctx.save();
+        ctx.setLineDash([6, 4]);
         ctx.beginPath();
-        for (let i = 0; i <= segments; i += 1) {
-          const t = i / segments;
-          const envelope = Math.sin(Math.PI * t);
-          const off = Math.sin(t * Math.PI * 9) * amp * envelope;
-          const x = pA.x + (pB.x - pA.x) * t + px * off;
-          const y = pA.y + (pB.y - pA.y) * t + py * off;
-          if (i === 0) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
-        }
+        if (pts.length) ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i += 1) ctx.lineTo(pts[i].x, pts[i].y);
         ctx.stroke();
+        ctx.restore();
         return;
       }
 
       if (conn.type === 'rod') {
+        const emphasis = Boolean(this.state.pendingPoint) && this.hoverId === conn.id;
         ctx.beginPath();
         ctx.moveTo(pA.x, pA.y);
         ctx.lineTo(pB.x, pB.y);
-        ctx.strokeStyle = selected ? '#ffffff' : '#d8d8d8';
-        ctx.lineWidth = selected ? 4.6 : 3.8;
+        ctx.strokeStyle = selected ? '#ffffff' : emphasis ? '#8fc7ff' : '#d8d8d8';
+        ctx.lineWidth = selected ? 4.6 : emphasis ? 6.8 : 3.8;
         ctx.stroke();
         ctx.strokeStyle = '#000';
-        ctx.lineWidth = selected ? 1.8 : 1.5;
+        ctx.lineWidth = selected ? 1.8 : emphasis ? 2.2 : 1.5;
         ctx.stroke();
         ctx.beginPath();
         ctx.moveTo(pA.x - px * 4, pA.y - py * 4);
@@ -4159,20 +5371,16 @@
         return;
       }
 
-      const span = this.connectorSpan(conn);
-      const slack = Math.max(0, conn.length - span);
-      const sag = slack > 0.008 ? Math.min(30, 4 + slack * PPU * zoom * 1.1) : 0;
+      const info = this.getRopeDisplayPath(conn);
+      const worlds = info ? info.points : [pA, pB];
+      const pts = worlds.map((p) => this.worldToScreen(p.x, p.y));
+      ctx.save();
+      if (info && info.sag > 0.5) ctx.setLineDash([5, 4]);
       ctx.beginPath();
-      ctx.moveTo(pA.x, pA.y);
-      if (sag > 0.5) {
-        ctx.quadraticCurveTo(
-          (pA.x + pB.x) / 2, (pA.y + pB.y) / 2 + sag * 1.7,
-          pB.x, pB.y
-        );
-      } else {
-        ctx.lineTo(pB.x, pB.y);
-      }
+      if (pts.length) ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i += 1) ctx.lineTo(pts[i].x, pts[i].y);
       ctx.stroke();
+      ctx.restore();
     }
 
     drawConnectors() {
@@ -4185,20 +5393,24 @@
         const b = this.worldToScreen(pB.x, pB.y);
         const selected = this.state.selectedId === conn.id;
         const hovered = this.hoverId === conn.id;
-        const fixed = this.getFixedAnchorInfo(conn);
+        const pointHostHover = Boolean(this.state.pendingPoint) && hovered;
+        const fixed = this.getFixedInfo(conn);
 
         if (fixed) {
-          const anchor = this.worldToScreen(fixed.anchor.x, fixed.anchor.y);
-          const dir = this.ensureLockDir(conn) || { x: 0, y: 1 };
-          ctx.save();
-          ctx.setLineDash([3, 5]);
-          ctx.strokeStyle = selected ? 'rgba(114,183,255,0.5)' : 'rgba(255,255,255,0.16)';
-          ctx.lineWidth = 1;
-          ctx.beginPath();
-          ctx.moveTo(anchor.x - dir.x * 22, anchor.y - dir.y * 22);
-          ctx.lineTo(anchor.x + dir.x * 22, anchor.y + dir.y * 22);
-          ctx.stroke();
-          ctx.restore();
+          const fixedPoint = this.getRefPoint(fixed.fixedRef);
+          if (fixedPoint) {
+            const anchor = this.worldToScreen(fixedPoint.x, fixedPoint.y);
+            const dir = this.ensureLockDir(conn) || { x: 0, y: 1 };
+            ctx.save();
+            ctx.setLineDash([3, 5]);
+            ctx.strokeStyle = selected ? 'rgba(114,183,255,0.5)' : 'rgba(255,255,255,0.16)';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(anchor.x - dir.x * 22, anchor.y - dir.y * 22);
+            ctx.lineTo(anchor.x + dir.x * 22, anchor.y + dir.y * 22);
+            ctx.stroke();
+            ctx.restore();
+          }
         }
 
         const colors = {
@@ -4207,8 +5419,8 @@
           rod: '#d8d8d8',
           rope: '#a4adb8'
         };
-        ctx.strokeStyle = selected ? '#ffffff' : hovered ? '#e9e9e9' : colors[conn.type];
-        ctx.lineWidth = selected ? 2.4 : hovered ? 2 : 1.5;
+        ctx.strokeStyle = selected ? '#ffffff' : pointHostHover ? '#8fc7ff' : hovered ? '#e9e9e9' : colors[conn.type];
+        ctx.lineWidth = selected ? 2.4 : pointHostHover ? 5.5 : hovered ? 2 : 1.5;
         this.connectorPath(conn, a, b, selected);
 
         if (selected) {
@@ -4426,6 +5638,82 @@
       }
     }
 
+    drawPoints() {
+      const ctx = this.ctx;
+      for (const entity of this.entities.values()) {
+        if (entity.kind !== 'point') continue;
+        const world = this.getRefPoint(this.refFor(entity));
+        if (!world) continue;
+        const p = this.worldToScreen(world.x, world.y);
+        const selected = this.state.selectedId === entity.id;
+        const hovered = this.hoverId === entity.id;
+        const color = selected ? '#72b7ff' : hovered ? '#ffffff' : '#e2e2e2';
+
+        if (entity.pointType === 'slider' && entity.hostKind === 'connector') {
+          const host = this.connectors.get(entity.hostId);
+          if (host) {
+            const nodes = (host.type === 'rope' || host.type === 'elastic')
+              ? (this.getRopeDisplayPath(host)?.points || this.getRopePathPoints(host))
+              : [this.getRefPoint(host.a), this.getRefPoint(host.b)];
+            const pts = nodes.filter(Boolean).map((n) => this.worldToScreen(n.x, n.y));
+            if (pts.length > 1) {
+              ctx.save();
+              ctx.setLineDash([2, 4]);
+              ctx.strokeStyle = 'rgba(114,183,255,0.45)';
+              ctx.lineWidth = 1;
+              ctx.beginPath();
+              ctx.moveTo(pts[0].x, pts[0].y);
+              for (let i = 1; i < pts.length; i += 1) ctx.lineTo(pts[i].x, pts[i].y);
+              ctx.stroke();
+              ctx.restore();
+            }
+          }
+        }
+
+        ctx.fillStyle = '#000';
+        ctx.strokeStyle = color;
+        ctx.lineWidth = selected ? 2.2 : 1.6;
+        if (entity.pointType === 'slider') {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 5.4, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 2, 0, Math.PI * 2);
+          ctx.fillStyle = color;
+          ctx.fill();
+        } else {
+          const r = 6.2;
+          ctx.beginPath();
+          ctx.moveTo(p.x, p.y - r);
+          ctx.lineTo(p.x + r, p.y);
+          ctx.lineTo(p.x, p.y + r);
+          ctx.lineTo(p.x - r, p.y);
+          ctx.closePath();
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = color;
+          ctx.fillRect(p.x - 1.6, p.y - 1.6, 3.2, 3.2);
+        }
+
+        if (selected) {
+          ctx.strokeStyle = 'rgba(114,183,255,0.55)';
+          ctx.lineWidth = 1;
+          const r = 11;
+          ctx.strokeRect(p.x - r, p.y - r, r * 2, r * 2);
+        }
+
+        if (selected || hovered) {
+          const type = entity._split || entity.hostKind === 'split'
+            ? '拆分结点'
+            : entity.pointType === 'slider' ? '滑点' : '动点';
+          this.drawLabel(`${entity.name} · ${type}`, p.x + 12, p.y - 1, '#dedede', {
+            align: 'left', baseline: 'middle', bg: 'rgba(0,0,0,0.8)'
+          });
+        }
+      }
+    }
+
     attachedHardFix(entityId) {
       for (const conn of this.getAttachedConnectors(entityId)) {
         if (conn.type === 'rod') return true;
@@ -4522,7 +5810,7 @@
         if (conn.type === 'rod') constrained = true;
         if (conn.type === 'rope' && conn._state === 'taut') constrained = true;
         if (conn.type === 'spring' || conn.type === 'elastic') {
-          if (this.getFixedAnchorInfo(conn)) constrained = true;
+          if (this.getFixedInfo(conn)) constrained = true;
         }
       }
       if (constrained) {
