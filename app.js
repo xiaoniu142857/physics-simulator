@@ -35,6 +35,12 @@
   const HISTORY_STRIDE = Math.max(1, Math.round((1 / FIXED_DT) / HISTORY_HZ));
   const HISTORY_MAX = 4200;
 
+  // Motion trails: muted colours that sit inside the black/orange/green/red UI.
+  const TRAIL_COLORS = ['#d9d9d9', '#ffab5e', '#7ee08a', '#ff8a80', '#72b7ff', '#e2c477', '#b9a7ff'];
+  const TRAIL_MAX_POINTS = 1400;
+  const TRAIL_MIN_STEP = 0.012;
+  const TRAIL_BREAK = 1.2;
+
   /* ------------------------------------------------------------------------
      Small utilities
      ------------------------------------------------------------------------ */
@@ -253,6 +259,7 @@
         showVelocity: false,
         showAcceleration: false,
         showGrid: true,
+        showTrails: true,
         selectedId: null,
         openPanel: 'objects',
         pendingConnector: null,
@@ -286,6 +293,8 @@
       this.hit = null;
       this.suppressClick = false;
       this.history = new Map();
+      this.trails = new Map();
+      this.trailColorTick = 0;
       this.historyTick = 0;
       this.chartTimer = 0;
       this.forceUiTimer = 0;
@@ -732,6 +741,7 @@
       this.state.simTime = 0;
       this.accumulator = 0;
       this.clearHistory();
+      this.clearTrails();
 
       for (const entity of this.entities.values()) {
         if (entity.kind === 'anchor') {
@@ -859,6 +869,8 @@
         height,
         friction,
         locked: Boolean(spec.locked),
+        showTrail: true,
+        trailColor: this.nextTrailColor(),
         body: null,
         home: null
       };
@@ -913,6 +925,8 @@
         friction,
         orientation: spec.orientation === 'left' ? 'left' : 'right',
         locked: spec.locked === undefined ? true : Boolean(spec.locked),
+        showTrail: true,
+        trailColor: this.nextTrailColor(),
         body: null,
         home: null
       };
@@ -1026,6 +1040,7 @@
       const entity = this.entities.get(id);
       if (!entity || entity._removing) return;
       entity._removing = true;
+      this.trails.delete(id);
       for (const point of [...this.entities.values()]) {
         if (point.kind === 'point' && point.hostKind === 'entity' && point.hostId === id) {
           this.removeEntity(point.id);
@@ -1844,6 +1859,8 @@
     clearScene(options = {}) {
       this.endForceDrag();
       this.clearHistory();
+      this.clearTrails();
+      this.trailColorTick = 0;
       this.resetEngine();
       this.counters = {
         block: 0, incline: 0, anchor: 0, spring: 0, elastic: 0, rod: 0, rope: 0,
@@ -2601,7 +2618,7 @@
         if (!entry) {
           entry = {
             t: [], v: [], a: [],
-            vx: [], vy: [], ax: [], ay: [], fx: [], fy: []
+            vx: [], vy: [], ax: [], ay: [], fx: [], fy: [], x: [], y: []
           };
           this.history.set(entity.id, entry);
         }
@@ -2626,8 +2643,12 @@
         entry.ay.push(ay);
         entry.fx.push(ax * entity.mass);
         entry.fy.push(ay * entity.mass);
+        // Position in the analysis frame: +x right, +y up (screen y is inverted).
+        entry.x.push(body.position.x);
+        entry.y.push(-body.position.y);
+        this.appendTrail(entity, body.position.x, body.position.y);
         if (entry.t.length > HISTORY_MAX) {
-          for (const key of ['t', 'v', 'a', 'vx', 'vy', 'ax', 'ay', 'fx', 'fy']) {
+          for (const key of ['t', 'v', 'a', 'vx', 'vy', 'ax', 'ay', 'fx', 'fy', 'x', 'y']) {
             entry[key].splice(0, 600);
           }
         }
@@ -2642,6 +2663,95 @@
         entity.body._histVx = 0;
         entity.body._histVy = 0;
       }
+    }
+
+    /* ----------------------------------------------------------------------
+       Motion trails (canvas paths per body)
+       ---------------------------------------------------------------------- */
+
+    nextTrailColor() {
+      const color = TRAIL_COLORS[this.trailColorTick % TRAIL_COLORS.length];
+      this.trailColorTick += 1;
+      return color;
+    }
+
+    appendTrail(entity, x, y) {
+      let trail = this.trails.get(entity.id);
+      if (!trail) {
+        trail = { color: entity.trailColor || this.nextTrailColor(), points: [] };
+        this.trails.set(entity.id, trail);
+      }
+      const pts = trail.points;
+      const n = pts.length;
+      if (n >= 2) {
+        const dx = x - pts[n - 2];
+        const dy = y - pts[n - 1];
+        const dist = Math.hypot(dx, dy);
+        if (dist > TRAIL_BREAK) {
+          // Teleport (edit drag, reset, preset): start a fresh segment.
+          pts.length = 0;
+        } else if (dist < TRAIL_MIN_STEP) {
+          return;
+        }
+      }
+      pts.push(x, y);
+      if (pts.length > TRAIL_MAX_POINTS * 2) {
+        pts.splice(0, pts.length - TRAIL_MAX_POINTS * 2);
+      }
+    }
+
+    clearTrail(id) {
+      this.trails.delete(id);
+    }
+
+    clearTrails() {
+      this.trails.clear();
+    }
+
+    drawTrails() {
+      if (!this.state.showTrails) return;
+      const ctx = this.ctx;
+      let drew = false;
+      for (const entity of this.entities.values()) {
+        if (!entity.body || entity.showTrail === false) continue;
+        const trail = this.trails.get(entity.id);
+        if (!trail || trail.points.length < 8) continue;
+        const pts = trail.points;
+        const count = pts.length / 2;
+        const screens = new Array(count);
+        for (let i = 0; i < count; i += 1) {
+          screens[i] = this.worldToScreen(pts[i * 2], pts[i * 2 + 1]);
+        }
+        // Older part of the path fades out, the newest part is brightest.
+        const chunks = [
+          { from: 0, to: Math.floor(count * 0.55), alpha: 0.22 },
+          { from: Math.floor(count * 0.55), to: Math.floor(count * 0.85), alpha: 0.4 },
+          { from: Math.floor(count * 0.85), to: count - 1, alpha: 0.62 }
+        ];
+        ctx.save();
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
+        ctx.lineWidth = 1.25;
+        ctx.strokeStyle = trail.color;
+        for (const chunk of chunks) {
+          if (chunk.to <= chunk.from) continue;
+          ctx.globalAlpha = chunk.alpha;
+          ctx.beginPath();
+          ctx.moveTo(screens[chunk.from].x, screens[chunk.from].y);
+          for (let i = chunk.from + 1; i <= chunk.to; i += 1) {
+            ctx.lineTo(screens[i].x, screens[i].y);
+          }
+          ctx.stroke();
+          drew = true;
+        }
+        ctx.globalAlpha = 0.85;
+        ctx.fillStyle = trail.color;
+        ctx.beginPath();
+        ctx.arc(screens[count - 1].x, screens[count - 1].y, 1.8, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+      if (drew) ctx.globalAlpha = 1;
     }
 
     prepareConnectorForces() {
@@ -3746,6 +3856,17 @@
     }
 
     renderDisplayPanel() {
+      const bodies = [...this.entities.values()].filter((e) => e.body);
+      const trailChips = bodies.map((entity) => {
+        const on = entity.showTrail !== false;
+        return `
+          <button type="button" class="trail-chip ${on && this.state.showTrails ? 'is-on' : ''}"
+            data-action="toggle-trail" data-id="${entity.id}" aria-pressed="${on ? 'true' : 'false'}"
+            title="${on ? '点击隐藏' : '点击显示'}${entity.name}的轨迹">
+            <i style="background:${entity.trailColor || '#d9d9d9'}"></i>${entity.name}
+          </button>
+        `;
+      }).join('');
       return `
         ${this.panelHeader('DISPLAY / 05', '显示')}
         <section class="panel-section">
@@ -3789,6 +3910,22 @@
             三类箭头各自使用统一比例尺：同一时刻所有物体的箭头长度与矢量大小成正比，零向量不绘制。比例显示在画布左下角。
           </div>
         </section>
+        <section class="panel-section">
+          <h3 class="section-title">运动轨迹</h3>
+          <div class="toggle-row">
+            <div class="toggle-copy">
+              <strong>显示轨迹</strong>
+              <small>记录每个物体质心走过的路径，颜色与下方列表一致。</small>
+            </div>
+            <button type="button" class="toggle ${this.state.showTrails ? 'is-on' : ''}"
+              data-action="toggle-display" data-key="showTrails" aria-pressed="${this.state.showTrails}"></button>
+          </div>
+          ${bodies.length ? `<div class="chip-row trail-row">${trailChips}</div>` : '<div class="empty-state">场景中没有物体。</div>'}
+          <button type="button" class="btn wide" data-action="clear-trails">清除轨迹</button>
+          <div class="notice">
+            点击上方物体名可单独隐藏/显示该物体的轨迹；编辑拖动或重置时会自动断开旧轨迹。
+          </div>
+        </section>
       `;
     }
 
@@ -3806,16 +3943,17 @@
           <h3 class="section-title">分析对象 <span class="section-count">${bodies.length} BODIES</span></h3>
           ${bodies.length ? `<div class="chip-row">${chips}</div>` : '<div class="empty-state">场景中没有可分析的物体。</div>'}
           <div class="section-copy">
-            每 1/60 秒采样一次，按水平 x（向右为正）与竖直 y（向上为正）两个分量分别记录，曲线窗口为最近 10 秒。
+            每 1/60 秒采样一次，按水平 x（向右为正）与竖直 y（向上为正）两个分量分别记录，曲线窗口为最近 10 秒。位移从世界原点算起，纵轴按该段时间的取值范围自适应。
           </div>
         </section>
         <section class="panel-section">
-          ${this.chartGroupHTML('force', 'F–t 合力', 'fx', 'fy', 'N')}
+          ${this.chartGroupHTML('position', 'x–t 位移', 'x', 'y', 'm')}
           ${this.chartGroupHTML('velocity', 'v–t 速度', 'vx', 'vy', 'm/s')}
           ${this.chartGroupHTML('acceleration', 'a–t 加速度', 'ax', 'ay', 'm/s²')}
+          ${this.chartGroupHTML('force', 'F–t 合力', 'fx', 'fy', 'N')}
           <button type="button" class="btn wide" data-action="clear-history">清空曲线数据</button>
           <div class="notice">
-            横轴为时间，纵轴中线上方为正、下方为负；合力由 F = ma 反推。锁定物体的速度恒为 0。
+            v–t、a–t、F–t 的纵轴中线上方为正、下方为负；x–t 的纵轴为实际位移范围。合力由 F = ma 反推。锁定物体的速度恒为 0。
           </div>
         </section>
       `;
@@ -4141,12 +4279,14 @@
 
     drawChart(canvas, key, entry) {
       const config = {
-        fx: { color: '#ff8a24', fallback: 10, axis: 'x' },
-        fy: { color: '#ff8a24', fallback: 10, axis: 'y' },
-        vx: { color: '#56e07b', fallback: 2, axis: 'x' },
-        vy: { color: '#56e07b', fallback: 2, axis: 'y' },
-        ax: { color: '#ff4e4e', fallback: 2, axis: 'x' },
-        ay: { color: '#ff4e4e', fallback: 2, axis: 'y' }
+        x: { color: '#72b7ff', fill: 'rgba(114,183,255,0.10)', fallback: 1, range: true },
+        y: { color: '#72b7ff', fill: 'rgba(114,183,255,0.10)', fallback: 1, range: true },
+        vx: { color: '#56e07b', fill: 'rgba(86,224,123,0.10)', fallback: 2 },
+        vy: { color: '#56e07b', fill: 'rgba(86,224,123,0.10)', fallback: 2 },
+        ax: { color: '#ff4e4e', fill: 'rgba(255,78,78,0.10)', fallback: 2 },
+        ay: { color: '#ff4e4e', fill: 'rgba(255,78,78,0.10)', fallback: 2 },
+        fx: { color: '#ff8a24', fill: 'rgba(255,138,36,0.10)', fallback: 10 },
+        fy: { color: '#ff8a24', fill: 'rgba(255,138,36,0.10)', fallback: 10 }
       }[key];
       if (!config) return;
 
@@ -4178,38 +4318,70 @@
 
       let startIndex = 0;
       while (startIndex < times.length && times[startIndex] < t0) startIndex += 1;
-      let maxAbs = 0;
-      const magnitudes = [];
-      for (let i = startIndex; i < series.length; i += 1) {
-        const value = series[i];
-        if (!Number.isFinite(value)) continue;
-        maxAbs = Math.max(maxAbs, Math.abs(value));
-        magnitudes.push(Math.abs(value));
+      let yLo;
+      let yHi;
+      if (config.range) {
+        // Position charts keep their absolute value, so the vertical axis spans the
+        // observed range instead of a symmetric band around zero.
+        let lo = Infinity;
+        let hi = -Infinity;
+        for (let i = startIndex; i < series.length; i += 1) {
+          const value = series[i];
+          if (!Number.isFinite(value)) continue;
+          lo = Math.min(lo, value);
+          hi = Math.max(hi, value);
+        }
+        if (!Number.isFinite(lo) || !Number.isFinite(hi)) {
+          lo = 0;
+          hi = config.fallback;
+        }
+        const mid = (lo + hi) / 2;
+        const half = Math.max((hi - lo) * 0.75, config.fallback * 0.35);
+        const niceHalf = Math.max(this.niceAxis(half), config.fallback * 0.2);
+        yLo = mid - niceHalf;
+        yHi = mid + niceHalf;
+      } else {
+        let maxAbs = 0;
+        const magnitudes = [];
+        for (let i = startIndex; i < series.length; i += 1) {
+          const value = series[i];
+          if (!Number.isFinite(value)) continue;
+          maxAbs = Math.max(maxAbs, Math.abs(value));
+          magnitudes.push(Math.abs(value));
+        }
+        // Scale on the bulk of the samples so a single impact spike does not flatten
+        // the whole curve; rare extremes simply run off the top edge.
+        let scaleRef = maxAbs;
+        if (magnitudes.length > 12) {
+          magnitudes.sort((a, b) => a - b);
+          const p = magnitudes[Math.floor(magnitudes.length * 0.92)] || maxAbs;
+          scaleRef = Math.max(p, maxAbs * 0.08);
+        }
+        const yMax = Math.max(this.niceAxis(scaleRef * 1.2), config.fallback * 0.25);
+        yLo = -yMax;
+        yHi = yMax;
       }
-      // Scale on the bulk of the samples so a single impact spike does not flatten
-      // the whole curve; rare extremes simply run off the top edge.
-      let scaleRef = maxAbs;
-      if (magnitudes.length > 12) {
-        magnitudes.sort((a, b) => a - b);
-        const p = magnitudes[Math.floor(magnitudes.length * 0.92)] || maxAbs;
-        scaleRef = Math.max(p, maxAbs * 0.08);
-      }
-      const yMax = Math.max(this.niceAxis(scaleRef * 1.2), config.fallback * 0.25);
-      const zeroY = padT + plotH / 2;
+      const spanY = yHi - yLo;
+      const toY = (value) => padT + plotH * (yHi - clamp(value, yLo, yHi)) / spanY;
+      const zeroY = toY(0);
 
       ctx.font = '7px "Cascadia Mono", Consolas, monospace';
       ctx.textBaseline = 'middle';
       ctx.textAlign = 'right';
 
-      for (const value of [yMax, 0, -yMax]) {
-        const y = zeroY - (value / yMax) * (plotH / 2);
-        ctx.strokeStyle = value === 0 ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.055)';
+      const ticks = config.range
+        ? [yHi, (yHi + yLo) / 2, yLo]
+        : [yHi, 0, yLo];
+      for (const value of ticks) {
+        const y = toY(value);
+        const isZero = Math.abs(value) < 1e-9;
+        ctx.strokeStyle = isZero ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.055)';
         ctx.lineWidth = 1;
         ctx.beginPath();
         ctx.moveTo(padL, Math.round(y) + 0.5);
         ctx.lineTo(padL + plotW, Math.round(y) + 0.5);
         ctx.stroke();
-        ctx.fillStyle = value === 0 ? '#6a6a6a' : '#4a4a4a';
+        ctx.fillStyle = isZero ? '#6a6a6a' : '#4a4a4a';
         ctx.fillText(this.axisTickLabel(value), padL - 3, y);
       }
 
@@ -4222,14 +4394,14 @@
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.fillStyle = '#3f3f3f';
-        ctx.fillText('等待数据', padL + plotW / 2, zeroY);
+        ctx.fillText('等待数据', padL + plotW / 2, padT + plotH / 2);
         return;
       }
 
       const toX = (t) => padL + ((t - t0) / (t1 - t0)) * plotW;
-      const toY = (value) => zeroY - (clamp(value, -yMax, yMax) / yMax) * (plotH / 2);
 
       const lastX = toX(times[times.length - 1]);
+      const baseline = config.range ? padT + plotH : zeroY;
       ctx.beginPath();
       let started = false;
       for (let i = startIndex; i < times.length; i += 1) {
@@ -4243,11 +4415,10 @@
         }
       }
       if (!started) return;
-      ctx.lineTo(lastX, zeroY);
-      ctx.lineTo(toX(times[startIndex]), zeroY);
+      ctx.lineTo(lastX, baseline);
+      ctx.lineTo(toX(times[startIndex]), baseline);
       ctx.closePath();
-      ctx.fillStyle = key.charAt(0) === 'f' ? 'rgba(255,138,36,0.10)'
-        : key.charAt(0) === 'v' ? 'rgba(86,224,123,0.10)' : 'rgba(255,78,78,0.10)';
+      ctx.fillStyle = config.fill;
       ctx.fill();
 
       ctx.beginPath();
@@ -4329,7 +4500,13 @@
         <section class="panel-section">
           <h3 class="section-title">曲线分析</h3>
           <div class="section-copy">
-            「曲线」面板记录所选物体的 F–t、v–t、a–t 曲线，每行左右两图分别是水平 x 与竖直 y 分量，向上、向右为正，带符号。采样频率 60 Hz，窗口为最近 10 秒。
+            「曲线」面板从上到下依次是 x–t 位移（蓝色）、v–t 速度（绿色）、a–t 加速度（红色）和 F–t 合力（橙色），每行左右两图分别是水平 x 与竖直 y 分量，向上、向右为正。采样频率 60 Hz，窗口为最近 10 秒。x–t 的纵轴按该段时间的位移范围自适应，其余三张以零为中线。
+          </div>
+        </section>
+        <section class="panel-section">
+          <h3 class="section-title">运动轨迹</h3>
+          <div class="section-copy">
+            「显示」面板里的「运动轨迹」会把每个物体质心的路径画在画布上，颜色与物体列表中的色标一致；点击某个物体名可以只隐藏它的轨迹，「清除轨迹」清空全部记录。编辑拖动、重置或切换预设后，旧轨迹会自动断开，不会连出一条假的直线。
           </div>
         </section>
         <section class="panel-section">
@@ -4703,6 +4880,19 @@
           this.renderPanel(true);
           break;
         }
+        case 'toggle-trail': {
+          const entity = this.entities.get(element.dataset.id);
+          if (!entity) break;
+          entity.showTrail = entity.showTrail === false;
+          if (entity.showTrail && !this.state.showTrails) this.state.showTrails = true;
+          this.renderPanel(true);
+          break;
+        }
+        case 'clear-trails':
+          this.clearTrails();
+          this.renderPanel(true);
+          this.toast('已清除轨迹');
+          break;
         case 'load-preset':
           this.loadPreset(element.dataset.preset);
           break;
@@ -4794,6 +4984,8 @@
         if (value === null) return '—';
         return `${formatSigned(value)} <small>${unit}</small>`;
       };
+      this.setLive('chart-x', read('x', 'm'));
+      this.setLive('chart-y', read('y', 'm'));
       this.setLive('chart-fx', read('fx', 'N'));
       this.setLive('chart-fy', read('fy', 'N'));
       this.setLive('chart-vx', read('vx', 'm/s'));
@@ -4964,6 +5156,9 @@
             let y = world.y - this.drag.offset.y;
             y = Math.min(y, 0.8);
             this.setAnchorPosition(entity, x, y);
+            this.refreshLocksAround(entity.id);
+            this.applyDirectionLocks();
+            this.updatePointPositions();
           } else if (entity.body) {
             let x = world.x - this.drag.offset.x;
             let y = world.y - this.drag.offset.y;
@@ -4979,6 +5174,11 @@
             entity.body._contactForce = { x: 0, y: 0 };
             entity.body._contactSmooth = null;
             this.refreshLocksAround(entity.id);
+            this.clearTrail(entity.id);
+            // Re-satisfy ropes and rods right away: without this, dragging in edit
+            // mode can pull an inextensible rope past its length.
+            this.applyDirectionLocks();
+            this.updatePointPositions();
           }
           this.updateLiveReadouts(true);
         } else if (this.drag.kind === 'point' && this.drag.moved) {
@@ -4988,6 +5188,8 @@
             y: world.y - this.drag.offset.y
           });
           this.refreshLocksAround(this.drag.entity.id);
+          this.applyDirectionLocks();
+          this.updatePointPositions();
           this.updateLiveReadouts(true);
         } else if (this.drag.kind === 'pan') {
           const scale = PPU * this.camera.zoom;
@@ -5200,6 +5402,7 @@
       this.drawGrid();
       this.drawGround();
       this.drawAxesAndLabels();
+      this.drawTrails();
       this.drawConnectors();
       this.drawEntities();
       this.drawAnchors();

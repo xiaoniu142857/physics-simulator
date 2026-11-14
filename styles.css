@@ -1660,6 +1660,46 @@ kbd {
   color: #050505;
 }
 
+/* Motion-trail selector: a colour swatch per body. */
+.trail-row {
+  margin-top: 2px;
+}
+
+.trail-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  border: 1px solid #222;
+  background: #080808;
+  color: #6f6f6f;
+  font-size: 9px;
+  letter-spacing: 0.02em;
+  border-radius: 0;
+  cursor: pointer;
+}
+
+.trail-chip i {
+  display: inline-block;
+  width: 9px;
+  height: 2px;
+  opacity: 0.4;
+}
+
+.trail-chip:hover {
+  border-color: #3a3a3a;
+  color: #d0d0d0;
+}
+
+.trail-chip.is-on {
+  border-color: #333;
+  color: #e2e2e2;
+}
+
+.trail-chip.is-on i {
+  opacity: 1;
+}
+
 .chart-block {
   margin-bottom: 14px;
 }
@@ -1736,6 +1776,10 @@ kbd {
 
 .chart-key.force {
   background: var(--orange);
+}
+
+.chart-key.position {
+  background: #72b7ff;
 }
 
 .chart-key.velocity {
