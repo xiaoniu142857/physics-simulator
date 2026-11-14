@@ -332,7 +332,7 @@
       this.updateLegend();
       this.updateZoomUI();
       this.updateLiveReadouts(true);
-      this.setHint('按空格开始模拟 · 拖动空白平移 · 拖动物体施加外力 · 滚轮缩放');
+      this.setHint('按空格开始模拟 · 拖动空白平移 · 拖动物体/动点/滑点施加外力 · 滚轮缩放');
 
       this.lastTime = performance.now();
       this.raf = requestAnimationFrame(this._frame);
@@ -1627,6 +1627,13 @@
       entity.locked = Boolean(locked);
       this.forceFrame += 1;
       if (entity.locked && this.state.dragBodyId === entity.id) this.endForceDrag();
+      if (entity.locked && this.forceDrag) {
+        // 正在拖动的动点附着在这个物体上时，锁定后施力自动撤销。
+        const dragged = this.entities.get(this.forceDrag.id);
+        if (dragged && dragged.kind === 'point' && dragged.hostId === entity.id) {
+          this.endForceDrag();
+        }
+      }
       this.applyEntityLock(entity);
       this.history.delete(entity.id);
       this.updateHome(entity);
@@ -2500,7 +2507,15 @@
       const drag = this.forceDrag;
       if (!drag || !drag.moved) return;
       const entity = this.entities.get(drag.id);
-      if (!entity || !entity.body || entity.locked) {
+      if (!entity) {
+        this.endForceDrag();
+        return;
+      }
+      if (drag.kind === 'point') {
+        this.applyPointDragForce(entity, drag);
+        return;
+      }
+      if (!entity.body || entity.locked) {
         this.endForceDrag();
         return;
       }
@@ -2546,6 +2561,185 @@
       }
       body._dragForce = { x: fx, y: fy };
       body._dragPoint = applyPoint;
+      drag.forceBody = body;
+    }
+
+    /* ----------------------------------------------------------------------
+       动点 / 滑点施力：力永远作用在点本身，与「重心 / 指针」设置无关。
+       动点附着在物体上时，把力传给宿主物体在该点的位置（会产生力矩）；
+       滑点/拆分结点带代理体时，力作用在代理体上，并通过绳、杆约束传给
+       两端物体；硬杆滑点的法向分力直接传给杆的两端，轴向分力让滑点沿杆
+       滑动。
+       ---------------------------------------------------------------------- */
+
+    pointDragAnchor(point) {
+      if (!point || point.kind !== 'point') return null;
+      if (point.proxy) {
+        if (point.proxy.isStatic) return null;
+        const host = point.hostKind === 'connector' ? this.connectors.get(point.hostId) : null;
+        return {
+          mode: 'proxy',
+          body: point.proxy,
+          position: { x: point.proxy.position.x, y: point.proxy.position.y },
+          velocity: this.bodyVelocity(point.proxy),
+          mass: Math.max(0.001, point.proxy.mass || POINT_PROXY_MASS),
+          // 硬杆滑点的轴向力作用在轻量代理体上，用等效中继质量做弹簧参数，
+          // 避免极小质量导致沿杆方向的高频振荡。
+          controlMass: Math.max(SPLIT_POINT_MASS, point.proxy.mass || POINT_PROXY_MASS),
+          rodSlider: point.pointType === 'slider' && Boolean(host && host.type === 'rod'),
+          host
+        };
+      }
+      if (point.hostKind === 'entity') {
+        const host = this.entities.get(point.hostId);
+        if (!host || !host.body || host.locked || host.body.isStatic) return null;
+        const position = this.localToWorld(host.body, point.local || { x: 0, y: 0 });
+        const velocity = this.bodyVelocity(host.body);
+        const omega = (host.body.angularVelocity || 0) * 60;
+        const rx = position.x - host.body.position.x;
+        const ry = position.y - host.body.position.y;
+        return {
+          mode: 'host',
+          body: host.body,
+          entity: host,
+          position,
+          // Velocity of the material point on the (possibly rotating) host body.
+          velocity: { x: velocity.x - omega * ry, y: velocity.y + omega * rx },
+          mass: Math.max(0.001, host.mass || host.body.mass)
+        };
+      }
+      const ref = this.refFor(point);
+      const supports = this.getRefSupports(ref);
+      if (!supports.position || supports.invMass <= 1e-12) return null;
+      // 支撑体在施力点处的实际速度（含转动贡献），单位 m/s，与弹簧阻尼匹配。
+      const velocity = { x: 0, y: 0 };
+      for (const support of supports.supports) {
+        if (!support.body) continue;
+        const omega = (support.body.angularVelocity || 0) * 60;
+        const rx = supports.position.x - support.body.position.x;
+        const ry = supports.position.y - support.body.position.y;
+        velocity.x += (support.body.velocity.x * 60 - omega * ry) * support.weight;
+        velocity.y += (support.body.velocity.y * 60 + omega * rx) * support.weight;
+      }
+      return {
+        mode: 'ref',
+        ref,
+        position: supports.position,
+        velocity,
+        mass: Math.max(0.001, 1 / supports.invMass)
+      };
+    }
+
+    canApplyForceToPoint(point) {
+      return Boolean(this.pointDragAnchor(point));
+    }
+
+    applyPointDragForce(point, drag) {
+      const anchor = this.pointDragAnchor(point);
+      if (!anchor) {
+        this.endForceDrag();
+        return;
+      }
+      const pointer = this.screenToWorld(this.pointer.x, this.pointer.y);
+      const target = { x: pointer.x - drag.offset.x, y: pointer.y - drag.offset.y };
+      const dx = target.x - anchor.position.x;
+      const dy = target.y - anchor.position.y;
+      const mass = Math.max(0.001, anchor.controlMass || anchor.mass);
+      const gravity = Math.max(1, this.state.gravity);
+      const stiffness = Math.max(45, mass * gravity * 14);
+      const damping = 2 * Math.sqrt(stiffness * mass) * 0.5;
+      let fx = stiffness * dx - damping * anchor.velocity.x;
+      let fy = stiffness * dy - damping * anchor.velocity.y;
+      const maxForce = Math.max(140, mass * gravity * 16);
+      const magnitude = Math.hypot(fx, fy);
+      if (magnitude > maxForce) {
+        fx *= maxForce / magnitude;
+        fy *= maxForce / magnitude;
+      }
+      if (!Number.isFinite(fx) || !Number.isFinite(fy)) {
+        this.endForceDrag();
+        return;
+      }
+
+      const force = { x: fx, y: fy };
+      drag.force = force;
+      drag.applyPoint = anchor.position;
+      drag.forceBody = null;
+      drag.showForceArrow = true;
+
+      if (anchor.mode === 'host') {
+        // 动点在物体上：力作用在物体上的该点，物体会平动并转动。
+        if (magnitude > 0.02) {
+          this.Body.applyForce(anchor.body, anchor.position, {
+            x: fx * FORCE_UNIT, y: fy * FORCE_UNIT
+          });
+        }
+        anchor.body._dragForce = force;
+        anchor.body._dragPoint = anchor.position;
+        drag.forceBody = anchor.body;
+        // 宿主物体自身的受力箭头已经会显示 F外，不再重复绘制。
+        drag.showForceArrow = false;
+        return;
+      }
+      this.applyPointDragForceToSupport(point, drag, anchor, force, magnitude);
+    }
+
+    applyPointDragForceToSupport(point, drag, anchor, force, magnitude) {
+      const fx = force.x;
+      const fy = force.y;
+      if (anchor.mode === 'proxy') {
+        drag.forceBody = anchor.body;
+        // 代理体只有极小质量；按等效中继质量缩放，避免数值爆炸。
+        const controlMass = Math.max(0.001, anchor.controlMass || anchor.mass);
+        const relayScale = Math.max(1e-6,
+          (anchor.body.mass || POINT_PROXY_MASS) / controlMass);
+        if (anchor.rodSlider && anchor.host) {
+          const tangent = this.getSliderHostTangent(this.refFor(point));
+          if (tangent) {
+            // 光滑滑点只能沿杆滑动：法向分力推动杆，轴向分力让滑点沿杆移动。
+            const along = fx * tangent.x + fy * tangent.y;
+            const axial = { x: tangent.x * along, y: tangent.y * along };
+            const normal = { x: fx - axial.x, y: fy - axial.y };
+            this.applyForceToConnectorAt(anchor.host, clamp(point.param ?? 0.5, 0, 1),
+              anchor.position, normal);
+            if (Math.hypot(axial.x, axial.y) > 0.02) {
+              this.Body.applyForce(anchor.body, anchor.body.position, {
+                x: axial.x * FORCE_UNIT * relayScale,
+                y: axial.y * FORCE_UNIT * relayScale
+              });
+            }
+            return;
+          }
+        }
+        if (magnitude > 0.02) {
+          this.Body.applyForce(anchor.body, anchor.position, {
+            x: fx * FORCE_UNIT * relayScale,
+            y: fy * FORCE_UNIT * relayScale
+          });
+        }
+        return;
+      }
+
+      // 没有代理体的动点（例如硬杆上的动点）：按权重把力分给连接件两端。
+      if (magnitude > 0.02) this.applyForceAtRef(anchor.ref, force);
+    }
+
+    /** 把力施加在连接件两端的支撑体上，作用点为世界坐标 worldPoint。 */
+    applyForceToConnectorAt(conn, t, worldPoint, force) {
+      if (!conn || !Number.isFinite(t)) return;
+      const sA = this.getRefSupports(conn.a);
+      const sB = this.getRefSupports(conn.b);
+      const parts = [
+        ...sA.supports.map((support) => ({ body: support.body, weight: support.weight * (1 - t) })),
+        ...sB.supports.map((support) => ({ body: support.body, weight: support.weight * t }))
+      ];
+      for (const part of parts) {
+        if (!part.body || part.body.isStatic || !Number.isFinite(part.weight)) continue;
+        const x = force.x * part.weight;
+        const y = force.y * part.weight;
+        if (Math.hypot(x, y) <= 0.02) continue;
+        this.Body.applyForce(part.body, worldPoint, { x: x * FORCE_UNIT, y: y * FORCE_UNIT });
+      }
     }
 
     localToWorld(body, local) {
@@ -2566,18 +2760,37 @@
     }
 
     startForceDrag(entity, worldPoint) {
-      if (!entity || !entity.body) return false;
+      if (!entity || this.state.mode !== 'physics') return false;
+      if (entity.kind === 'point') {
+        // 点/滑点是力的作用点本身：与「重心 / 指针」模式无关。
+        const anchor = this.pointDragAnchor(entity);
+        if (!anchor) {
+          this.toast('这个点附着的物体已锁定或固定，无法施力');
+          return false;
+        }
+        this.forceDrag = {
+          kind: 'point',
+          id: entity.id,
+          offset: { x: worldPoint.x - anchor.position.x, y: worldPoint.y - anchor.position.y },
+          moved: false
+        };
+        this.state.dragBodyId = entity.id;
+        this.forceFrame += 1;
+        return true;
+      }
+      if (!entity.body) return false;
       if (entity.locked) {
         this.toast('该物体已锁定，先在属性面板解锁后才能拖动施力');
         return false;
       }
-      if (this.state.mode !== 'physics') return false;
       const body = entity.body;
       this.forceDrag = {
+        kind: 'body',
         id: entity.id,
         offset: { x: worldPoint.x - body.position.x, y: worldPoint.y - body.position.y },
         local: this.worldToLocal(body, worldPoint),
-        moved: false
+        moved: false,
+        forceBody: body
       };
       this.state.dragBodyId = entity.id;
       body._dragForce = { x: 0, y: 0 };
@@ -2588,6 +2801,10 @@
     endForceDrag() {
       const drag = this.forceDrag;
       if (drag) {
+        if (drag.forceBody) {
+          drag.forceBody._dragForce = { x: 0, y: 0 };
+          drag.forceBody._dragPoint = null;
+        }
         const entity = this.entities.get(drag.id);
         if (entity && entity.body) {
           entity.body._dragForce = { x: 0, y: 0 };
@@ -4470,10 +4687,11 @@
         <section class="panel-section">
           <h3 class="section-title">物理模式</h3>
           <div class="section-copy">
-            按住任意未锁定的物体并拖动，就在重心处施加一个外力；松手立即撤销。拖动时模拟继续运行，受力箭头、速度和加速度同步更新。
+            按住任意未锁定的物体、动点或滑点并拖动，就施加一个外力；松手立即撤销。拖动时模拟继续运行，受力箭头、速度和加速度同步更新。
           </div>
           <div class="notice">
-            底部「拖拽 施力点」可切换施力位置：默认<strong>重心</strong>，拖动不会让物体凭空旋转；切到<strong>指针</strong>后，力作用在鼠标按下的那个点上，物体会被拉得转动起来（这是默认关闭的额外模式）。
+            底部「拖拽 施力点」可切换施力位置：默认<strong>重心</strong>，拖动不会让物体凭空旋转；切到<strong>指针</strong>后，力作用在鼠标按下的那个点上，物体会被拉得转动起来（这是默认关闭的额外模式）。<br>
+            直接拖动<strong>动点</strong>或<strong>滑点</strong>时，外力始终作用在点本身，不受这个设置影响：点会带着宿主物体移动，滑点还会沿轻绳/硬杆滑动。
           </div>
           <div class="notice">
             拖动物体以外的空白处仍然是平移画布。受力箭头按各自的比例尺线性绘制，接触力画在实际接触点上，因此叠放物块之间的压力会单独显示。
@@ -5064,9 +5282,9 @@
         return;
       }
 
-      if (this.state.mode === 'physics' && hit && hit.type === 'body') {
+      if (this.state.mode === 'physics' && hit && (hit.type === 'body' || hit.type === 'point')) {
         const entity = this.entities.get(hit.id);
-        if (entity && !entity.locked) {
+        if (entity && (entity.kind === 'point' || !entity.locked)) {
           const world = this.screenToWorld(p.x, p.y);
           if (this.startForceDrag(entity, world)) {
             this.drag = { kind: 'force', id: entity.id, startX: p.x, startY: p.y, moved: false };
@@ -5141,9 +5359,11 @@
           if (this.drag.moved && this.forceDrag) {
             this.forceDrag.moved = true;
             if (!this.state.running) this.startSimulation();
-            this.setHint(this.state.dragAtPoint
-              ? '拖动中：外力作用在按下的位置，物体会随之转动'
-              : '拖动中：外力作用在重心，松开即撤销');
+            this.setHint(this.forceDrag.kind === 'point'
+              ? '拖动中：外力作用在点/滑点上，点会带动物体移动'
+              : this.state.dragAtPoint
+                ? '拖动中：外力作用在按下的位置，物体会随之转动'
+                : '拖动中：外力作用在重心，松开即撤销');
           }
           return;
         }
@@ -5213,9 +5433,12 @@
         this.canvas.classList.add('is-movable');
       } else {
         this.canvas.classList.remove('is-movable');
-        if (this.state.mode === 'physics' && hit && hit.type === 'body') {
+        if (this.state.mode === 'physics' && hit && (hit.type === 'body' || hit.type === 'point')) {
           const entity = this.entities.get(hit.id);
-          if (entity && !entity.locked) this.canvas.classList.add('is-pullable');
+          const pullable = entity && (entity.kind === 'point'
+            ? this.canApplyForceToPoint(entity)
+            : !entity.locked);
+          if (pullable) this.canvas.classList.add('is-pullable');
         }
       }
     }
@@ -5270,9 +5493,12 @@
       const hit = this.hitTest(p.x, p.y);
       if (this.state.mode === 'edit' && hit && (hit.type === 'anchor' || hit.type === 'body' || hit.type === 'point')) {
         this.canvas.classList.add('is-movable');
-      } else if (this.state.mode === 'physics' && hit && hit.type === 'body') {
+      } else if (this.state.mode === 'physics' && hit && (hit.type === 'body' || hit.type === 'point')) {
         const entity = this.entities.get(hit.id);
-        if (entity && !entity.locked) this.canvas.classList.add('is-pullable');
+        const pullable = entity && (entity.kind === 'point'
+          ? this.canApplyForceToPoint(entity)
+          : !entity.locked);
+        if (pullable) this.canvas.classList.add('is-pullable');
       }
     }
 
@@ -6390,8 +6616,14 @@
       const drag = this.forceDrag;
       if (!drag || !drag.moved) return;
       const entity = this.entities.get(drag.id);
-      if (!entity || !entity.body) return;
-      const grab = this.localToWorld(entity.body, drag.local);
+      if (!entity) return;
+      let grab = null;
+      if (drag.kind === 'point') {
+        grab = this.getRefPoint(this.refFor(entity));
+      } else if (entity.body) {
+        grab = this.localToWorld(entity.body, drag.local);
+      }
+      if (!grab) return;
       const a = this.worldToScreen(grab.x, grab.y);
       const ctx = this.ctx;
       ctx.save();
@@ -6408,6 +6640,23 @@
       ctx.beginPath();
       ctx.arc(a.x, a.y, 4, 0, Math.PI * 2);
       ctx.stroke();
+
+      // 点/滑点的外力箭头：代理体不在受力分析列表里，需要单独画出 F外。
+      if (!drag.showForceArrow || !this.state.showForces) return;
+      const force = drag.force;
+      if (!force) return;
+      const mag = Math.hypot(force.x, force.y);
+      if (mag < EPS.force) return;
+      const scale = this.scales.force || VECTOR_SCALE.force.base;
+      const length = Math.min(mag * scale, VECTOR_SCALE.force.target * 1.6);
+      const ux = force.x / mag;
+      const uy = force.y / mag;
+      const point = drag.applyPoint || grab;
+      const origin = this.worldToScreen(point.x, point.y);
+      const label = `F外 ${formatForce(mag)} N`;
+      const placement = this.placeArrowLabel(label, origin, ux, uy, length, 'side');
+      this.drawArrow(origin, { x: ux * length, y: uy * length }, VECTOR.force, 1.8,
+        label, placement);
     }
 
     drawArrow(origin, vector, color, width, label, options = {}) {
