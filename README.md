@@ -34,6 +34,11 @@
 - 锁定：点击物体左上角的锁图标即可锁定 / 解锁；锁定物体完全静止，但仍参与碰撞与受力分析
 - 预设场景：综合演示、斜面滑块、弹簧振子、硬杆摆
 
+**场景导入 / 导出**
+- 「场景」面板可把当前时刻导出为 JSON 文件，也可导入之前保存的文件，或把 JSON 直接拖到画布上
+- 保存内容：物体与连接件的全部参数、位置、角度、速度、自转、锁定、重力与地面摩擦、显示开关、视角、选中对象、计数器，以及（可选）曲线历史与运动轨迹
+- 只有鼠标正在拖拽的外力不会被保存；导入失败会保留原场景
+
 ## 操作速查
 
 | 操作 | 方式 |
@@ -49,6 +54,8 @@
 | 切换施力点 | 底部「拖拽 施力点 重心 / 指针」（只影响拖动物体，不影响动点/滑点） |
 | 锁定物体 | 点物体左上角的锁图标 |
 | 修改参数 | 编辑模式 → 右侧面板 |
+| 导出场景 | 场景面板 →「导出场景」 |
+| 导入场景 | 场景面板 →「导入场景」，或把 JSON 拖到画布上 |
 
 右侧工具栏依次为：物体、连接、受力、场景、显示、曲线、帮助；底栏提供播放控制、倍速（0.25×–2×）和状态提示。
 
@@ -69,6 +76,42 @@ styles.css   纯黑极简样式
 app.js       全部逻辑：场景与物理、渲染、面板、图表
 LICENSE      GPL-3.0
 ```
+
+## 场景文件格式
+
+导出文件是普通 JSON，顶层结构如下（数值保留 6 位小数）：
+
+```json
+{
+  "format": "mechanics-lab-scene",
+  "version": 1,
+  "savedAt": "2026-11-16T12:57:12.000Z",
+  "state": { "simTime": 1.11, "gravity": 9.8, "groundFriction": 0.5, "running": false, "mode": "physics", "showGrid": true, "...": "显示开关与选中项" },
+  "camera": { "x": 1.25, "y": -2.75, "zoom": 1.35 },
+  "counters": { "block": 2, "anchor": 1, "...": 0 },
+  "idCounter": 22,
+  "trailColorTick": 3,
+  "entities": [
+    { "id": "b7", "kind": "block", "name": "物块 1", "mass": 2, "width": 0.55, "height": 0.55,
+      "friction": 0.3, "locked": false, "position": { "x": 2.1, "y": -3.7 },
+      "angle": 0.25, "velocity": { "x": 0.036, "y": 0.019 }, "angularVelocity": 0, "home": { "x": 2.1, "y": -3.7, "angle": 0.25 } },
+    { "id": "a8", "kind": "anchor", "name": "锚点 1", "x": 1.2, "y": -4.8 },
+    { "id": "p17", "kind": "point", "pointType": "slider", "hostKind": "connector", "hostId": "c16", "param": 0.99 }
+  ],
+  "connectors": [
+    { "id": "c10", "type": "rod", "a": { "kind": "anchor", "id": "a8" }, "b": { "kind": "body", "id": "b7" },
+      "k": 30, "restLength": 1.2, "length": 1.4, "fixedA": true, "fixedB": false,
+      "lockDir": { "x": 0.63, "y": 0.77 }, "lockSign": 1, "sliders": [] }
+  ],
+  "history": [ { "id": "b7", "t": [0, 0.016], "x": [2.1, 2.1], "...": "v / a / vx / vy / ax / ay / fx / fy" } ],
+  "trails": [ { "id": "b7", "color": "#72b7ff", "points": [2.1, -3.7, 2.11, -3.71] } ]
+}
+```
+
+- `entities[].kind`：`block`、`incline`、`anchor`、`point`（`pointType` 为 `dynamic` / `slider`）
+- `connectors[].type`：`spring`、`elastic`、`rod`、`rope`；`sliders` 是挂在绳上的滑点 id
+- `history` / `trails` 仅在勾选「包含曲线与轨迹」时写入，缺失时导入后图表从零开始
+- 未识别的字段会被忽略；`format` 不匹配或物体类型未知时整份文件被拒绝，当前场景保持不变
 
 ## 说明与限制
 

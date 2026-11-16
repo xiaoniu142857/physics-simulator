@@ -34,6 +34,12 @@
   const HISTORY_HZ = 60;
   const HISTORY_STRIDE = Math.max(1, Math.round((1 / FIXED_DT) / HISTORY_HZ));
   const HISTORY_MAX = 4200;
+  const HISTORY_KEYS = ['t', 'v', 'a', 'vx', 'vy', 'ax', 'ay', 'fx', 'fy', 'x', 'y'];
+
+  const SCENE_FILE_FORMAT = 'mechanics-lab-scene';
+  const SCENE_FILE_VERSION = 1;
+  const ZOOM_MIN = 0.18;
+  const ZOOM_MAX = 5;
 
   // Motion trails: muted colours that sit inside the black/orange/green/red UI.
   const TRAIL_COLORS = ['#d9d9d9', '#ffab5e', '#7ee08a', '#ff8a80', '#72b7ff', '#e2c477', '#b9a7ff'];
@@ -58,6 +64,14 @@
   const roundTo = (v, digits = 2) => {
     const p = 10 ** digits;
     return Math.round(v * p) / p;
+  };
+  /* Keep exported numbers compact; NaN/Infinity never reach a JSON file. */
+  const roundNumber = (v, digits = 6) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return 0;
+    const p = 10 ** digits;
+    const r = Math.round(n * p) / p;
+    return Object.is(r, -0) ? 0 : r;
   };
 
   function formatNumber(value, digits = 2) {
@@ -214,6 +228,8 @@
     pendulum: { label: '硬杆摆', note: '定长约束' }
   };
 
+  const PANEL_IDS = [...TOOL_DEFS.map((tool) => tool.id), 'help'];
+
   /* ------------------------------------------------------------------------
      Main application
      ------------------------------------------------------------------------ */
@@ -267,7 +283,8 @@
         hoverId: null,
         pointerInside: false,
         dragBodyId: null,
-        dragAtPoint: false
+        dragAtPoint: false,
+        exportHistory: true
       };
 
       this.camera = { x: -0.1, y: -2.35, zoom: 1 };
@@ -576,6 +593,35 @@
         });
       }
       this.updateDragPointUI();
+
+      // Scene import: a hidden file input plus drag & drop onto the canvas.
+      this.sceneFileInput = document.getElementById('sceneFileInput');
+      if (this.sceneFileInput) {
+        this.sceneFileInput.addEventListener('change', () => {
+          const file = this.sceneFileInput.files?.[0];
+          this.sceneFileInput.value = '';
+          if (file) this.importSceneFile(file);
+        });
+      }
+      const stage = document.getElementById('stage');
+      if (stage) {
+        stage.addEventListener('dragover', (event) => {
+          if (!event.dataTransfer) return;
+          event.preventDefault();
+          event.dataTransfer.dropEffect = 'copy';
+          stage.classList.add('is-dropping');
+        });
+        stage.addEventListener('dragleave', (event) => {
+          if (!stage.contains(event.relatedTarget)) stage.classList.remove('is-dropping');
+        });
+        stage.addEventListener('drop', (event) => {
+          stage.classList.remove('is-dropping');
+          const file = event.dataTransfer?.files?.[0];
+          if (!file) return;
+          event.preventDefault();
+          this.importSceneFile(file);
+        });
+      }
 
       document.getElementById('speedGroup').addEventListener('click', (event) => {
         const button = event.target.closest('[data-speed]');
@@ -1948,6 +1994,465 @@
       if (this.state.openPanel) this.renderPanel();
       if (!options.silent) {
         this.toast(`已载入「${PRESET_INFO[name]?.label || '预设'}」`, 1800);
+      }
+    }
+
+    /* ----------------------------------------------------------------------
+       Scene import / export
+       Everything except the transient mouse-drag force is stored, so the file
+       restores the exact moment the user saved: positions, velocities, spins,
+       connectors, locks, counters, view, display flags, history and trails.
+       ---------------------------------------------------------------------- */
+
+    serializeScene(options = {}) {
+      const withHistory = options.withHistory !== false;
+      const state = this.state;
+      const entities = [];
+      for (const entity of this.entities.values()) {
+        if (entity.kind === 'anchor') {
+          entities.push({
+            id: entity.id,
+            kind: 'anchor',
+            name: entity.name,
+            x: roundNumber(entity.x),
+            y: roundNumber(entity.y)
+          });
+          continue;
+        }
+        if (entity.kind === 'point') {
+          const world = this.getRefPoint(this.refFor(entity)) || { x: 0, y: 0 };
+          entities.push({
+            id: entity.id,
+            kind: 'point',
+            pointType: entity.pointType,
+            name: entity.name,
+            hostKind: entity.hostKind,
+            hostId: entity.hostId,
+            param: roundNumber(entity.param ?? 0),
+            local: entity.local
+              ? { x: roundNumber(entity.local.x), y: roundNumber(entity.local.y) }
+              : null,
+            split: Boolean(entity._split),
+            position: { x: roundNumber(world.x), y: roundNumber(world.y) },
+            velocity: entity.proxy
+              ? { x: roundNumber(entity.proxy.velocity.x), y: roundNumber(entity.proxy.velocity.y) }
+              : null
+          });
+          continue;
+        }
+        const body = entity.body;
+        if (!body) continue;
+        const item = {
+          id: entity.id,
+          kind: entity.kind,
+          name: entity.name,
+          mass: roundNumber(entity.mass),
+          friction: roundNumber(entity.friction),
+          locked: Boolean(entity.locked),
+          showTrail: entity.showTrail !== false,
+          trailColor: entity.trailColor || null,
+          position: { x: roundNumber(body.position.x), y: roundNumber(body.position.y) },
+          angle: roundNumber(body.angle),
+          velocity: { x: roundNumber(body.velocity.x), y: roundNumber(body.velocity.y) },
+          angularVelocity: roundNumber(body.angularVelocity),
+          home: entity.home
+            ? {
+                x: roundNumber(entity.home.x),
+                y: roundNumber(entity.home.y),
+                angle: roundNumber(entity.home.angle || 0)
+              }
+            : null
+        };
+        if (entity.kind === 'block') {
+          item.width = roundNumber(entity.width);
+          item.height = roundNumber(entity.height);
+        } else {
+          item.base = roundNumber(entity.base);
+          item.height = roundNumber(entity.height);
+          item.orientation = entity.orientation === 'left' ? 'left' : 'right';
+        }
+        entities.push(item);
+      }
+
+      const connectors = [];
+      for (const conn of this.connectors.values()) {
+        connectors.push({
+          id: conn.id,
+          type: conn.type,
+          name: conn.name,
+          a: { kind: conn.a.kind, id: conn.a.id },
+          b: { kind: conn.b.kind, id: conn.b.id },
+          k: roundNumber(conn.k),
+          restLength: roundNumber(conn.restLength),
+          length: roundNumber(conn.length),
+          fixedA: Boolean(conn.fixedA),
+          fixedB: Boolean(conn.fixedB),
+          lockDir: conn.lockDir
+            ? { x: roundNumber(conn.lockDir.x), y: roundNumber(conn.lockDir.y) }
+            : null,
+          lockSign: conn._lockSign === -1 ? -1 : 1,
+          sliders: Array.isArray(conn.sliders) ? [...conn.sliders] : []
+        });
+      }
+
+      const data = {
+        format: SCENE_FILE_FORMAT,
+        version: SCENE_FILE_VERSION,
+        savedAt: new Date().toISOString(),
+        state: {
+          mode: state.mode,
+          running: Boolean(state.running),
+          speed: state.speed,
+          simTime: roundNumber(state.simTime),
+          gravity: state.gravity,
+          groundFriction: state.groundFriction,
+          showForces: Boolean(state.showForces),
+          showVelocity: Boolean(state.showVelocity),
+          showAcceleration: Boolean(state.showAcceleration),
+          showGrid: Boolean(state.showGrid),
+          showTrails: Boolean(state.showTrails),
+          dragAtPoint: Boolean(state.dragAtPoint),
+          selectedId: state.selectedId || null,
+          openPanel: state.openPanel || null
+        },
+        camera: {
+          x: roundNumber(this.camera.x),
+          y: roundNumber(this.camera.y),
+          zoom: roundNumber(this.camera.zoom)
+        },
+        counters: { ...this.counters },
+        idCounter: this._idCounter || 0,
+        trailColorTick: this.trailColorTick || 0,
+        entities,
+        connectors
+      };
+
+      if (withHistory) {
+        data.history = [];
+        for (const [id, entry] of this.history) {
+          const record = { id };
+          for (const key of HISTORY_KEYS) {
+            record[key] = (entry[key] || []).map((value) => roundNumber(value, 5));
+          }
+          data.history.push(record);
+        }
+        data.trails = [...this.trails].map(([id, trail]) => ({
+          id,
+          color: trail.color,
+          points: trail.points.map((value) => roundNumber(value, 4))
+        }));
+      }
+      return data;
+    }
+
+    /* Rebuild a scene from a serialized object. Throws on malformed input. */
+    restoreSceneData(data) {
+      if (!data || data.format !== SCENE_FILE_FORMAT) {
+        throw new Error('不是力学实验室的场景文件');
+      }
+      if (!Array.isArray(data.entities) || !Array.isArray(data.connectors)) {
+        throw new Error('场景文件缺少 objects 数据');
+      }
+
+      this.pauseSimulation();
+      this.endForceDrag();
+      this.clearScene({ silent: true });
+      this.trailColorTick = 0;
+      this._idCounter = 0;
+
+      // --- 1. global parameters -------------------------------------------------
+      const saved = data.state || {};
+      this.state.gravity = clamp(Number(saved.gravity ?? 9.8), 0, 20);
+      this.engine.gravity.y = this.state.gravity;
+      this.state.groundFriction = clamp(Number(saved.groundFriction ?? 0.5), 0, 5);
+      this.state.simTime = Math.max(0, Number(saved.simTime) || 0);
+
+      // --- 2. anchors and bodies ------------------------------------------------
+      for (const item of data.entities) {
+        if (!item || !item.id) continue;
+        if (item.kind === 'anchor') {
+          this.entities.set(item.id, {
+            id: item.id,
+            kind: 'anchor',
+            name: item.name || '锚点',
+            x: Number(item.x) || 0,
+            y: Number(item.y) || 0,
+            proxy: null,
+            home: null
+          });
+          continue;
+        }
+        if (item.kind === 'point') continue;   // second pass, needs connectors
+        if (item.kind !== 'block' && item.kind !== 'incline') {
+          throw new Error(`未知的物体类型：${item.kind}`);
+        }
+        const entity = item.kind === 'block'
+          ? {
+              id: item.id,
+              kind: 'block',
+              name: item.name || '物块',
+              mass: clamp(Number(item.mass) || 1, 0.001, 100),
+              width: clamp(Number(item.width) || 0.8, 0.1, 5),
+              height: clamp(Number(item.height) || 0.5, 0.1, 5),
+              friction: clamp(Number(item.friction ?? 0.3), 0, 5),
+              locked: Boolean(item.locked),
+              showTrail: item.showTrail !== false,
+              trailColor: item.trailColor || null,
+              body: null,
+              home: null
+            }
+          : {
+              id: item.id,
+              kind: 'incline',
+              name: item.name || '斜面',
+              mass: clamp(Number(item.mass) || 10, 0.001, 100),
+              base: clamp(Number(item.base) || 3, 0.1, 5),
+              height: clamp(Number(item.height) || 1.5, 0.1, 5),
+              friction: clamp(Number(item.friction ?? 0.4), 0, 5),
+              orientation: item.orientation === 'left' ? 'left' : 'right',
+              locked: Boolean(item.locked),
+              showTrail: item.showTrail !== false,
+              trailColor: item.trailColor || null,
+              body: null,
+              home: null
+            };
+        this.entities.set(entity.id, entity);
+        if (entity.kind === 'block') {
+          this.buildBlockBody(entity, item.position || { x: 0, y: -1 }, Number(item.angle) || 0);
+        } else {
+          this.buildInclineBody(entity, 0, 0, 0);
+          this.Body.setPosition(entity.body, item.position || { x: 0, y: -1 });
+          this.Body.setAngle(entity.body, Number(item.angle) || 0);
+        }
+        if (item.home) {
+          entity.home = {
+            x: Number(item.home.x),
+            y: Number(item.home.y),
+            angle: Number(item.home.angle) || 0
+          };
+        }
+      }
+
+      // Anchors need their static proxy bodies once the map is populated.
+      for (const entity of this.entities.values()) {
+        if (entity.kind === 'anchor') this.buildAnchorProxy(entity);
+      }
+
+      // --- 3. connectors (endpoints may be points created below) ----------------
+      for (const item of data.connectors) {
+        if (!item || !item.id || !CONNECTOR_INFO[item.type]) continue;
+        const conn = {
+          id: item.id,
+          kind: 'connector',
+          type: item.type,
+          name: item.name || CONNECTOR_INFO[item.type].label,
+          a: { ...item.a },
+          b: { ...item.b },
+          k: clamp(Number(item.k) || 30, 1, 100000),
+          restLength: clamp(Number(item.restLength) || 1, 0.05, 20),
+          length: clamp(Number(item.length) || 1, 0.05, 20),
+          fixedA: Boolean(item.fixedA),
+          fixedB: Boolean(item.fixedB),
+          sliders: [],
+          lockDir: item.lockDir
+            ? normalize({ x: Number(item.lockDir.x) || 0, y: Number(item.lockDir.y) || -1 }, { x: 0, y: -1 })
+            : null,
+          _lockSign: item.lockSign === -1 ? -1 : 1,
+          constraint: null,
+          _state: 'neutral'
+        };
+        if (conn.type !== 'spring' && conn.type !== 'rod') {
+          conn.fixedA = false;
+          conn.fixedB = false;
+        }
+        this.connectors.set(conn.id, conn);
+      }
+
+      // --- 4. points ------------------------------------------------------------
+      for (const item of data.entities) {
+        if (!item || item.kind !== 'point') continue;
+        const point = {
+          id: item.id,
+          kind: 'point',
+          pointType: item.pointType === 'slider' ? 'slider' : 'dynamic',
+          name: item.name || '动点',
+          hostKind: item.hostKind === 'connector' ? 'connector' : 'entity',
+          hostId: item.hostId,
+          param: roundNumber(item.param ?? 0),
+          local: item.local ? { x: Number(item.local.x) || 0, y: Number(item.local.y) || 0 } : null,
+          proxy: null,
+          home: null,
+          _split: Boolean(item.split)
+        };
+        this.entities.set(point.id, point);
+        const needsProxy = point.pointType === 'slider' || point._split;
+        if (needsProxy) {
+          this.buildPointProxy(point, item.position || { x: 0, y: 0 });
+          if (item.velocity && point.proxy) {
+            this.Body.setVelocity(point.proxy, {
+              x: Number(item.velocity.x) || 0,
+              y: Number(item.velocity.y) || 0
+            });
+          }
+        }
+      }
+
+      // --- 5. slider registration + constraints --------------------------------
+      // Restore the original insertion order so panel lists do not shuffle.
+      const ordered = new Map();
+      for (const item of data.entities) {
+        const entity = item && this.entities.get(item.id);
+        if (entity) ordered.set(entity.id, entity);
+      }
+      for (const [id, entity] of this.entities) {
+        if (!ordered.has(id)) ordered.set(id, entity);
+      }
+      this.entities = ordered;
+
+      for (const item of data.connectors) {
+        const conn = this.connectors.get(item?.id);
+        if (!conn || !Array.isArray(item.sliders)) continue;
+        conn.sliders = item.sliders.filter((id) => this.entities.has(id));
+      }
+      this.syncAllConnectors();
+      for (const conn of this.connectors.values()) {
+        if (this.getFixedInfo(conn) && !conn.lockDir) this.ensureLockDir(conn, true);
+      }
+
+      // --- 6. per-body runtime state -------------------------------------------
+      for (const item of data.entities) {
+        const entity = this.entities.get(item?.id);
+        if (!entity || !entity.body) continue;
+        const body = entity.body;
+        if (!entity.locked) {
+          this.Body.setVelocity(body, {
+            x: Number(item.velocity?.x) || 0,
+            y: Number(item.velocity?.y) || 0
+          });
+          this.Body.setAngularVelocity(body, Number(item.angularVelocity) || 0);
+        }
+        body._accel = { x: 0, y: 0 };
+        body._lastV = { x: body.velocity.x * 60, y: body.velocity.y * 60 };
+        body._accelTime = this.state.simTime;
+      }
+
+      // --- 7. counters, view and display flags ---------------------------------
+      if (data.counters && typeof data.counters === 'object') {
+        for (const key of Object.keys(this.counters)) {
+          const value = Number(data.counters[key]);
+          if (Number.isFinite(value) && value >= 0) this.counters[key] = value;
+        }
+      }
+      this._idCounter = Math.max(0, Number(data.idCounter) || 0);
+      this.trailColorTick = Math.max(0, Number(data.trailColorTick) || 0);
+
+      this.state.simTime = Math.max(0, Number(saved.simTime) || 0);
+      this.state.speed = [0.25, 0.5, 1, 2].includes(Number(saved.speed)) ? Number(saved.speed) : 1;
+      this.state.showForces = saved.showForces !== false;
+      this.state.showVelocity = Boolean(saved.showVelocity);
+      this.state.showAcceleration = Boolean(saved.showAcceleration);
+      this.state.showGrid = saved.showGrid !== false;
+      this.state.showTrails = saved.showTrails !== false;
+      this.state.dragAtPoint = Boolean(saved.dragAtPoint);
+      this.state.mode = saved.mode === 'edit' ? 'edit' : 'physics';
+
+      const camera = data.camera || {};
+      this.camera.x = Number(camera.x) || 0;
+      this.camera.y = Number(camera.y) || 0;
+      this.camera.zoom = clamp(Number(camera.zoom) || 1, ZOOM_MIN, ZOOM_MAX);
+      // --- 8. history and trails -----------------------------------------------
+      this.history.clear();
+      this.trails.clear();
+      for (const record of Array.isArray(data.history) ? data.history : []) {
+        if (!record || !this.entities.has(record.id)) continue;
+        const entry = {};
+        for (const key of HISTORY_KEYS) {
+          entry[key] = Array.isArray(record[key])
+            ? record[key].map((value) => Number(value) || 0)
+            : [];
+        }
+        const size = entry.t.length;
+        for (const key of HISTORY_KEYS) if (entry[key].length > size) entry[key].length = size;
+        this.history.set(record.id, entry);
+      }
+      for (const trail of Array.isArray(data.trails) ? data.trails : []) {
+        if (!trail || !this.entities.has(trail.id) || !Array.isArray(trail.points)) continue;
+        const points = trail.points.map((value) => Number(value) || 0);
+        if (points.length < 2) continue;
+        this.trails.set(trail.id, {
+          color: trail.color || this.entities.get(trail.id).trailColor || '#d9d9d9',
+          points
+        });
+      }
+
+      // --- 9. UI ----------------------------------------------------------------
+      this.state.selectedId = saved.selectedId && (
+        this.entities.has(saved.selectedId) || this.connectors.has(saved.selectedId)
+      ) ? saved.selectedId : null;
+      if (saved.openPanel && PANEL_IDS.includes(saved.openPanel)) {
+        this.state.openPanel = saved.openPanel;
+      }
+      this.accumulator = 0;
+      this.lastTime = performance.now();
+      this.updateModeUI();
+      this.updateDragPointUI();
+      this.updateLegend();
+      this.updateZoomUI();
+      this.setSpeed(this.state.speed);
+      this.updateTransportUI();
+      this.updateLiveReadouts(true);
+      if (this.state.openPanel) this.renderPanel();
+      // Resume running scenes, but keep edit mode paused exactly as saved.
+      if (saved.running && this.state.mode !== 'edit') this.startSimulation();
+    }
+
+    exportScene() {
+      const data = this.serializeScene({ withHistory: Boolean(this.state.exportHistory) });
+      const stamp = new Date();
+      const pad = (value) => String(value).padStart(2, '0');
+      const name = `mechanics-lab-${stamp.getFullYear()}${pad(stamp.getMonth() + 1)}${pad(stamp.getDate())}`
+        + `-${pad(stamp.getHours())}${pad(stamp.getMinutes())}${pad(stamp.getSeconds())}.json`;
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = name;
+      link.rel = 'noopener';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 2000);
+      this.toast(`已导出 ${name}`, 2200);
+      return data;
+    }
+
+    /* Parse + apply, rolling back to the current scene if anything fails. */
+    applySceneData(data) {
+      const backup = this.serializeScene({ withHistory: true });
+      try {
+        this.restoreSceneData(data);
+        this.toast('场景已导入');
+        return true;
+      } catch (error) {
+        try {
+          this.restoreSceneData(backup);
+        } catch (nested) {
+          this.clearScene({ silent: true });
+        }
+        this.toast(`导入失败：${error.message}`, 3200);
+        return false;
+      }
+    }
+
+    async importSceneFile(file) {
+      if (!file) return false;
+      try {
+        const text = await file.text();
+        const data = JSON.parse(text);
+        return this.applySceneData(data);
+      } catch (error) {
+        this.toast(`导入失败：${error.message}`, 3200);
+        return false;
       }
     }
 
@@ -4065,6 +4570,24 @@
           <div class="preset-list">${presets}</div>
         </section>
         <section class="panel-section">
+          <h3 class="section-title">导入 / 导出 <span class="section-count">JSON</span></h3>
+          <div class="btn-row">
+            <button type="button" class="btn" data-action="export-scene">导出场景</button>
+            <button type="button" class="btn" data-action="import-scene">导入场景</button>
+          </div>
+          <div class="toggle-row">
+            <div class="toggle-copy">
+              <strong>包含曲线与轨迹</strong>
+              <small>把当前时刻的历史采样和运动轨迹一并写入文件，导入后曲线可以直接接着画。</small>
+            </div>
+            <button type="button" class="toggle ${this.state.exportHistory ? 'is-on' : ''}"
+              data-action="toggle-export-history" aria-pressed="${this.state.exportHistory}"></button>
+          </div>
+          <div class="notice">
+            文件保存当前时刻的全部状态：物体位置、速度、自转、连接件与锁定、重力与地面摩擦、显示开关、视角、选中对象，以及曲线和轨迹数据；只有鼠标正在拖拽的外力不保存。导入时也可以把 JSON 文件直接拖到画布上。
+          </div>
+        </section>
+        <section class="panel-section">
           <h3 class="section-title">重置</h3>
           <button type="button" class="btn wide danger" data-action="clear-scene">清空整个场景</button>
           <div class="notice">清空后无法恢复。按 <kbd>R</kbd> 只会让物体回到初始位置。</div>
@@ -4734,6 +5257,15 @@
           </div>
         </section>
         <section class="panel-section">
+          <h3 class="section-title">导入 / 导出</h3>
+          <div class="section-copy">
+            「场景」面板里的「导出场景」把当前时刻存成一个 JSON 文件；「导入场景」选择该文件即可完整还原，也可以直接把 JSON 文件拖到画布上。导入会替换当前场景，失败时保留原场景。
+          </div>
+          <div class="notice">
+            文件内容包括物体与连接件、位置、角度、速度、自转、锁定、重力与地面摩擦、显示开关、视角、选中对象和计数器；勾选「包含曲线与轨迹」时还会写入历史采样与运动轨迹。只有鼠标正在拖拽的外力不会被保存。
+          </div>
+        </section>
+        <section class="panel-section">
           <h3 class="section-title">模型说明</h3>
           <div class="section-copy">
             摩擦使用库仑模型：界面摩擦系数取两物体 μ 的较小值，最大静摩擦与滑动摩擦按同一 μ 计算。斜面与地面之间、物体之间都会发生摩擦。
@@ -5118,6 +5650,16 @@
           if (window.confirm('确定清空整个场景吗？此操作无法撤销。')) {
             this.clearScene();
           }
+          break;
+        case 'export-scene':
+          this.exportScene();
+          break;
+        case 'import-scene':
+          this.sceneFileInput?.click();
+          break;
+        case 'toggle-export-history':
+          this.state.exportHistory = !this.state.exportHistory;
+          this.renderPanel(true);
           break;
         default:
           break;
