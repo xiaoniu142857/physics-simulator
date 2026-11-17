@@ -1,5 +1,5 @@
 /* ==========================================================================
-   力学实验室 · Mechanics Lab — v1.0.0
+   力学实验室 · Mechanics Lab — v1.0.1
    A browser-based high-school mechanics sandbox built on Matter.js.
 
    Architecture (single bundle, no build step):
@@ -65,6 +65,7 @@
   const TRAIL_BREAK = 0.9;         // a jump larger than this starts a new segment
   const TRAIL_GAP = 0.35;          // seconds of missing samples also split segments
   const TRAIL_HEAD_FADE = 1.8;     // seconds over which the oldest part fades out
+  const TRAIL_TAIL_ALPHA = 0.04;   // opacity right at the trimmed end
   const TRAIL_FADE_RATE = 6;       // 1/s, show/hide cross-fade speed
 
   /* ------------------------------------------------------------------------
@@ -420,7 +421,7 @@
   const PANEL_IDS = [...TOOL_DEFS.map((tool) => tool.id), 'help'];
 
   const APP_NAME = 'Mechanics Lab';
-  const APP_VERSION = '1.0.0';
+  const APP_VERSION = '1.0.1';
   const SCENE_FORMAT = 'mechanics-lab.scene';
   const SCENE_SCHEMA = 1;
   // Files written before v1.0.0 used this older identifier; they are still read.
@@ -3841,7 +3842,7 @@
         trail = {
           color: entity.trailColor || this.nextTrailColor(),
           segments: [],
-          fade: 1,
+          fade: 0,
           target: 1
         };
         this.trails.set(entity.id, trail);
@@ -3935,7 +3936,7 @@
       const ctx = this.ctx;
       ctx.save();
       ctx.lineJoin = 'round';
-      ctx.lineCap = 'round';
+      ctx.lineCap = 'butt';
       ctx.lineWidth = 1.25;
       for (const [id, trail] of this.trails) {
         this.drawTrail(ctx, trail, this.state.selectedId === id);
@@ -3945,48 +3946,111 @@
       ctx.restore();
     }
 
+    /* Trace one slice of a trail segment with the current stroke style. */
+    traceTrailSlice(ctx, segment, from, to) {
+      if (to <= from) return;
+      const a = this.worldToScreen(segment[from * 3], segment[from * 3 + 1]);
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      for (let i = from + 1; i <= to; i += 1) {
+        const p = this.worldToScreen(segment[i * 3], segment[i * 3 + 1]);
+        ctx.lineTo(p.x, p.y);
+      }
+      ctx.stroke();
+    }
+
+    /* '#rrggbb' -> 'rgba(r,g,b,a)'; used where a color must carry its own alpha. */
+    trailTint(color, alpha) {
+      const hex = String(color || '#d9d9d9').replace('#', '');
+      const full = hex.length === 3
+        ? hex.split('').map((c) => c + c).join('')
+        : hex.padEnd(6, '0').slice(0, 6);
+      const r = parseInt(full.slice(0, 2), 16) || 217;
+      const g = parseInt(full.slice(2, 4), 16) || 217;
+      const b = parseInt(full.slice(4, 6), 16) || 217;
+      return `rgba(${r},${g},${b},${clamp(alpha, 0, 1).toFixed(4)})`;
+    }
+
+    /* Paint one trail. The tail is drawn as a few long slices whose stroke is a
+       linear gradient, so the opacity changes continuously per pixel instead of
+       stepping at slice boundaries (which is what made the tail look striped). */
     drawTrail(ctx, trail, selected) {
-      const alpha = trail.fade;
-      if (alpha <= 0.01 || !trail.segments.length) return;
-      const newest = trail.segments[trail.segments.length - 1];
-      if (!newest || newest.length < 6) return;
-      // Fade window measured in simulation seconds over the retained samples.
+      const fade = trail.fade;
+      if (fade <= 0.01 || !trail.segments.length) return;
+
+      // Time range of everything that is still retained.
       let oldestT = Infinity;
-      for (const seg of trail.segments) if (seg.length) oldestT = Math.min(oldestT, seg[2]);
-      if (!Number.isFinite(oldestT)) return;
-      const span = Math.max(1e-3, newest[newest.length - 1] - oldestT);
+      let newestT = -Infinity;
+      for (const seg of trail.segments) {
+        if (seg.length < 3) continue;
+        if (seg[2] < oldestT) oldestT = seg[2];
+        const endT = seg[seg.length - 1];
+        if (endT > newestT) newestT = endT;
+      }
+      if (!Number.isFinite(oldestT) || !Number.isFinite(newestT)) return;
+
+      const span = Math.max(1e-3, newestT - oldestT);
       const fadeSpan = Math.min(TRAIL_HEAD_FADE, Math.max(0.35, span * 0.4));
+      const floor = TRAIL_TAIL_ALPHA;
+      const alphaAt = (simTime) => {
+        if (fadeSpan <= 1e-6) return 1;
+        const u = clamp((simTime - oldestT) / fadeSpan, 0, 1);
+        const s = u * u * (3 - 2 * u);        // smoothstep: soft head, soft join
+        return floor + (1 - floor) * s;
+      };
+      const tint = (alpha) => this.trailTint(trail.color, clamp(fade * alpha, 0, 1));
+
       ctx.strokeStyle = trail.color;
+      let tip = null;
       for (const segment of trail.segments) {
         const n = segment.length / 3;
         if (n < 2) continue;
-        // Draw in a handful of alpha buckets so the whole trail fades smoothly
-        // without issuing one stroke per sample.
-        const buckets = Math.min(12, Math.max(1, Math.ceil(n / 24)));
-        const perBucket = Math.max(1, Math.ceil((n - 1) / buckets));
-        for (let start = 0; start < n - 1; start += perBucket) {
-          const end = Math.min(n - 1, start + perBucket);
-          const rel = clamp((segment[start * 3 + 2] - oldestT) / fadeSpan, 0, 1);
-          // Newest part stays bright; the oldest tail disappears into the black.
-          ctx.globalAlpha = alpha * (0.10 + 0.90 * rel * rel);
-          ctx.beginPath();
-          const sx = this.worldToScreen(segment[start * 3], segment[start * 3 + 1]);
-          ctx.moveTo(sx.x, sx.y);
-          for (let i = start + 1; i <= end; i += 1) {
-            const p = this.worldToScreen(segment[i * 3], segment[i * 3 + 1]);
-            ctx.lineTo(p.x, p.y);
+        let split = 0;
+        while (split < n && segment[split * 3 + 2] < oldestT + fadeSpan) split += 1;
+        const fadeEnd = clamp(split - 1, 0, n - 1);
+
+        if (fadeEnd > 0) {
+          // Four gradient slices over the fading part: enough for a smooth ramp,
+          // few enough that stroke seams are practically invisible.
+          const pieces = clamp(Math.ceil(fadeEnd / 12), 2, 4);
+          const step = Math.max(1, Math.ceil(fadeEnd / pieces));
+          for (let start = 0; start < fadeEnd; start += step) {
+            const end = Math.min(fadeEnd, start + step);
+            const a0 = clamp(fade * alphaAt(segment[start * 3 + 2]), 0, 1);
+            const a1 = clamp(fade * alphaAt(segment[end * 3 + 2]), 0, 1);
+            const from = this.worldToScreen(segment[start * 3], segment[start * 3 + 1]);
+            const to = this.worldToScreen(segment[end * 3], segment[end * 3 + 1]);
+            const chord = Math.hypot(to.x - from.x, to.y - from.y);
+            if (chord < 0.75) {
+              ctx.globalAlpha = (a0 + a1) / 2;
+            } else {
+              const gradient = ctx.createLinearGradient(from.x, from.y, to.x, to.y);
+              gradient.addColorStop(0, tint(a0));
+              gradient.addColorStop(1, tint(a1));
+              ctx.globalAlpha = 1;
+              ctx.strokeStyle = gradient;
+            }
+            this.traceTrailSlice(ctx, segment, start, end);
           }
-          ctx.stroke();
         }
+
+        if (fadeEnd < n - 1) {
+          ctx.strokeStyle = trail.color;
+          ctx.globalAlpha = clamp(fade, 0, 1);
+          this.traceTrailSlice(ctx, segment, Math.max(0, fadeEnd), n - 1);
+        }
+        tip = { x: segment[(n - 1) * 3], y: segment[(n - 1) * 3 + 1] };
       }
-      if (alpha > 0.5) {
-        const tip = this.worldToScreen(newest[newest.length - 3], newest[newest.length - 2]);
-        ctx.globalAlpha = alpha * (selected ? 1 : 0.9);
+
+      if (tip && fade > 0.5) {
+        const p = this.worldToScreen(tip.x, tip.y);
+        ctx.globalAlpha = clamp(fade, 0, 1);
         ctx.fillStyle = trail.color;
         ctx.beginPath();
-        ctx.arc(tip.x, tip.y, selected ? 2.4 : 1.9, 0, Math.PI * 2);
+        ctx.arc(p.x, p.y, selected ? 2.2 : 1.6, 0, Math.PI * 2);
         ctx.fill();
       }
+      ctx.globalAlpha = 1;
     }
 
     prepareConnectorForces() {
