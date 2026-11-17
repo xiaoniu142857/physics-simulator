@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#000000" />
+  <meta name="description" content="力学实验室：浏览器里的高中力学模拟器，真实单位与比例，可施力、可分析、可导出场景。" />
   <title>力学实验室 · Mechanics Lab</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
@@ -72,29 +73,22 @@
         </button>
         <button type="button" class="transport-btn" id="btnStep" title="单步前进">单步</button>
         <button type="button" class="transport-btn" id="btnReset" title="重置到初始位置">重置</button>
-        <div class="time-readout">
-          <span class="time-label">仿真时间</span>
-          <strong id="timeReadout">0.00 <small>s</small></strong>
-        </div>
-      </div>
-
-      <div class="transport-center">
-        <span class="speed-label">倍速</span>
+        <div class="transport-divider" aria-hidden="true"></div>
         <div class="speed-group" id="speedGroup" role="group" aria-label="播放倍速">
-          <button type="button" data-speed="0.25">0.25×</button>
-          <button type="button" data-speed="0.5">0.5×</button>
-          <button type="button" data-speed="1" class="is-active">1×</button>
-          <button type="button" data-speed="2">2×</button>
+          <button type="button" data-speed="0.25" title="0.25 倍速">0.25×</button>
+          <button type="button" data-speed="0.5" title="0.5 倍速">0.5×</button>
+          <button type="button" data-speed="1" class="is-active" title="正常速度">1×</button>
+          <button type="button" data-speed="2" title="2 倍速">2×</button>
         </div>
       </div>
 
       <div class="transport-right">
         <span class="shortcut"><kbd>空格</kbd> 暂停/继续</span>
-        <button type="button" class="shortcut-btn" id="btnDragPoint" aria-pressed="false"
-          title="切换拖拽时的施力点：重心 / 鼠标按下的位置">
-          <kbd>拖拽</kbd> 施力点 <b id="dragPointText">重心</b>
-        </button>
         <span class="shortcut"><kbd>Del</kbd> 删除</span>
+        <div class="time-readout">
+          <span class="time-label">仿真时间</span>
+          <strong id="timeReadout">0.00 <small>s</small></strong>
+        </div>
       </div>
     </footer>
   </div>

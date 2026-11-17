@@ -1,6 +1,24 @@
 /* ==========================================================================
-   力学实验室 · Mechanics Lab
+   力学实验室 · Mechanics Lab — v1.0.0
    A browser-based high-school mechanics sandbox built on Matter.js.
+
+   Architecture (single bundle, no build step):
+
+     §0  Constants & utilities      units, limits, colour, small helpers
+     §1  Scene file format          schema-1 serializer, normalizer, migration
+     §2  MechanicsLab class
+         · world & physics          360 Hz fixed step, custom Coulomb friction,
+                                    ropes/rods/springs, anchors, points
+         · interaction              pointer input, editing, force dragging
+         · panels                   object/connector/settings/file/display/
+                                    charts/forces/help renderers
+         · rendering                Canvas 2D: grid, bodies, vectors, trails,
+                                    labels, overlays
+     §3  Boot                       CDN fallback, error surface, start loop
+
+   Conventions:
+     · Matter.js world units are metres and screen y grows downward.
+     · Analysis/UI and the saved file use y-up and SI units.
    ========================================================================== */
 (() => {
   'use strict';
@@ -34,18 +52,20 @@
   const HISTORY_HZ = 60;
   const HISTORY_STRIDE = Math.max(1, Math.round((1 / FIXED_DT) / HISTORY_HZ));
   const HISTORY_MAX = 4200;
-  const HISTORY_KEYS = ['t', 'v', 'a', 'vx', 'vy', 'ax', 'ay', 'fx', 'fy', 'x', 'y'];
+  // t + signed components + position; magnitudes are derived when needed.
+  const HISTORY_KEYS = ['t', 'x', 'y', 'vx', 'vy', 'ax', 'ay', 'fx', 'fy'];
 
-  const SCENE_FILE_FORMAT = 'mechanics-lab-scene';
-  const SCENE_FILE_VERSION = 1;
   const ZOOM_MIN = 0.18;
   const ZOOM_MAX = 5;
 
   // Motion trails: muted colours that sit inside the black/orange/green/red UI.
   const TRAIL_COLORS = ['#d9d9d9', '#ffab5e', '#7ee08a', '#ff8a80', '#72b7ff', '#e2c477', '#b9a7ff'];
-  const TRAIL_MAX_POINTS = 1400;
-  const TRAIL_MIN_STEP = 0.012;
-  const TRAIL_BREAK = 1.2;
+  const TRAIL_MAX_POINTS = 1600;   // per body, in samples
+  const TRAIL_MIN_STEP = 0.008;    // metres between samples
+  const TRAIL_BREAK = 0.9;         // a jump larger than this starts a new segment
+  const TRAIL_GAP = 0.35;          // seconds of missing samples also split segments
+  const TRAIL_HEAD_FADE = 1.8;     // seconds over which the oldest part fades out
+  const TRAIL_FADE_RATE = 6;       // 1/s, show/hide cross-fade speed
 
   /* ------------------------------------------------------------------------
      Small utilities
@@ -182,6 +202,7 @@
     objects: svg('<path d="M12 2.8 21 7.4v9.1L12 21.2 3 16.5V7.4L12 2.8Z"/><path d="M3 7.4 12 12l9-4.6M12 12v9.2"/>'),
     connectors: svg('<path d="M3 14.8c1.8-6.4 3.6-6.4 5.4 0s3.6 6.4 5.4 0 3.6-6.4 5.4 0"/><path d="M2 18.6h20"/>'),
     scene: svg('<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h9M17 18h3"/><path d="M13 4v4M7 10v4M13 16v4"/>'),
+    file: svg('<path d="M6 3h8l4 4v14H6V3Z"/><path d="M14 3v4h4"/><path d="M9 12h6M9 16h6"/>'),
     display: svg('<path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6S2.5 12 2.5 12Z"/><path d="M12 9.3A2.7 2.7 0 1 0 12 14.7 2.7 2.7 0 0 0 12 9.3Z"/>'),
     chart: svg('<path d="M3 3v18h18"/><path d="M5.5 15.5 9.5 10l3.5 3.5L20 6"/><path d="M16.6 6H20v3.4"/>'),
     forces: svg('<path d="M12 12V3.6M12 12l7.3 4.2M12 12 4.7 16.2"/><path d="M9.9 5.5 12 3.4l2.1 2.1M18.2 14.4l2.1 1.3-2.2 1.5M5.8 15.7l-2.2-1.5 2.2-1.3"/><circle cx="12" cy="12" r="1.7" fill="currentColor" stroke="none"/>'),
@@ -205,13 +226,181 @@
     unlocked: svg('<path d="M6 10h12v10H6z"/><path d="M8.5 10V7.5a3.5 3.5 0 0 1 6.4-1.9"/>')
   };
 
+  const num = (value, fallback = 0) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
+
+  /* Convert a pre-1.0.0 scene file (screen units, y down) into schema 1. */
+  function migrateLegacyScene(input) {
+    const state = input.state || {};
+    const camera = input.camera || {};
+    const legacyEntities = Array.isArray(input.entities) ? input.entities : [];
+    const legacyConnectors = Array.isArray(input.connectors) ? input.connectors : [];
+    const entities = [];
+
+    for (const item of legacyEntities) {
+      if (!item || !item.id) continue;
+      if (item.kind === 'anchor') {
+        entities.push({
+          type: 'anchor',
+          id: item.id,
+          name: item.name,
+          position: { x: num(item.x), y: -num(item.y) }
+        });
+      } else if (item.kind === 'point') {
+        const pos = item.position || { x: 0, y: 0 };
+        entities.push({
+          type: 'point',
+          id: item.id,
+          name: item.name,
+          pointType: item.pointType === 'slider' ? 'slider' : 'dynamic',
+          host: {
+            kind: item.hostKind === 'connector' ? 'connector' : 'entity',
+            id: item.hostId
+          },
+          param: num(item.param),
+          split: Boolean(item.split),
+          position: { x: num(pos.x), y: -num(pos.y) }
+        });
+      } else if (item.kind === 'block' || item.kind === 'incline') {
+        const pos = item.position || { x: 0, y: 0 };
+        const vel = item.velocity || { x: 0, y: 0 };
+        const out = {
+          type: item.kind,
+          id: item.id,
+          name: item.name,
+          mass: num(item.mass),
+          friction: num(item.friction),
+          locked: Boolean(item.locked),
+          trail: { visible: item.showTrail !== false, color: item.trailColor || null },
+          state: {
+            position: { x: num(pos.x), y: -num(pos.y) },
+            rotation: -num(item.angle),
+            velocity: { x: num(vel.x) * 60, y: -num(vel.y) * 60 },
+            spin: -num(item.angularVelocity) * 60
+          },
+          home: item.home
+            ? {
+                position: { x: num(item.home.x), y: -num(item.home.y) },
+                rotation: -num(item.home.angle)
+              }
+            : null
+        };
+        if (item.kind === 'block') {
+          out.size = { w: num(item.width), h: num(item.height) };
+        } else {
+          out.size = { base: num(item.base), h: num(item.height) };
+          out.orientation = item.orientation === 'left' ? 'left' : 'right';
+        }
+        entities.push(out);
+      }
+    }
+
+    const connectors = [];
+    for (const conn of legacyConnectors) {
+      if (!conn || !conn.id || !conn.a || !conn.b) continue;
+      const out = {
+        type: conn.type,
+        id: conn.id,
+        name: conn.name,
+        ends: [conn.a.id, conn.b.id],
+        fixed: {
+          a: Boolean(conn.fixedA),
+          b: Boolean(conn.fixedB),
+          direction: conn.lockDir
+            ? { x: num(conn.lockDir.x), y: -num(conn.lockDir.y) }
+            : null,
+          sign: conn.lockSign === -1 ? -1 : 1
+        },
+        sliders: Array.isArray(conn.sliders) ? [...conn.sliders] : []
+      };
+      if (conn.type === 'spring' || conn.type === 'elastic') {
+        out.parameters = { k: num(conn.k), restLength: num(conn.restLength) };
+      } else {
+        out.length = num(conn.length);
+      }
+      connectors.push(out);
+    }
+
+    let history;
+    if (Array.isArray(input.history)) {
+      const series = [];
+      for (const record of input.history) {
+        if (!record || !record.id) continue;
+        const channels = { id: record.id };
+        for (const key of HISTORY_KEYS) {
+          channels[key] = Array.isArray(record[key])
+            ? record[key].map((value) => num(value))
+            : [];
+        }
+        series.push(channels);
+      }
+      history = { hz: HISTORY_HZ, window: 10, series };
+    }
+
+    let trails;
+    if (Array.isArray(input.trails)) {
+      trails = [];
+      for (const trail of input.trails) {
+        if (!trail || !trail.id || !Array.isArray(trail.points)) continue;
+        const flat = [];
+        const count = Math.floor(trail.points.length / 2);
+        for (let i = 0; i < count; i += 1) {
+          // Legacy trails had no timestamps: rebuild them at the sample rate.
+          flat.push(num(trail.points[i * 2]), -num(trail.points[i * 2 + 1]), i / HISTORY_HZ);
+        }
+        if (flat.length >= 6) {
+          trails.push({ id: trail.id, color: trail.color, segments: [flat] });
+        }
+      }
+    }
+
+    return {
+      format: SCENE_FORMAT,
+      schema: SCENE_SCHEMA,
+      app: { name: APP_NAME, version: `legacy-${input.version || 1}` },
+      savedAt: input.savedAt || new Date().toISOString(),
+      world: {
+        gravity: num(state.gravity, 9.8),
+        groundFriction: num(state.groundFriction, 0.5)
+      },
+      simulation: {
+        time: num(state.simTime),
+        running: Boolean(state.running),
+        speed: [0.25, 0.5, 1, 2].includes(Number(state.speed)) ? Number(state.speed) : 1,
+        mode: state.mode === 'edit' ? 'edit' : 'physics',
+        dragAtPoint: Boolean(state.dragAtPoint)
+      },
+      view: {
+        camera: { x: num(camera.x), y: -num(camera.y), zoom: num(camera.zoom, 1) },
+        show: {
+          forces: state.showForces !== false,
+          velocity: Boolean(state.showVelocity),
+          acceleration: Boolean(state.showAcceleration),
+          grid: state.showGrid !== false,
+          trails: state.showTrails !== false
+        },
+        selectedId: state.selectedId || null,
+        panel: state.openPanel || null
+      },
+      naming: {
+        counters: input.counters || {},
+        nextId: num(input.idCounter),
+        trailColor: num(input.trailColorTick)
+      },
+      entities,
+      connectors,
+      ...(history ? { history } : {}),
+      ...(trails ? { trails } : {})
+    };
+  }
+
   const TOOL_DEFS = [
     { id: 'objects', label: '物体', icon: 'objects' },
     { id: 'connectors', label: '连接', icon: 'connectors' },
     { id: 'forces', label: '受力', icon: 'forces' },
-    { id: 'scene', label: '场景', icon: 'scene' },
+    { id: 'analysis', label: '曲线', icon: 'chart' },
     { id: 'display', label: '显示', icon: 'display' },
-    { id: 'analysis', label: '曲线', icon: 'chart' }
+    { id: 'settings', label: '设置', icon: 'scene' },
+    { id: 'file', label: '文件', icon: 'file' }
   ];
 
   const CONNECTOR_INFO = {
@@ -229,6 +418,15 @@
   };
 
   const PANEL_IDS = [...TOOL_DEFS.map((tool) => tool.id), 'help'];
+
+  const APP_NAME = 'Mechanics Lab';
+  const APP_VERSION = '1.0.0';
+  const SCENE_FORMAT = 'mechanics-lab.scene';
+  const SCENE_SCHEMA = 1;
+  // Files written before v1.0.0 used this older identifier; they are still read.
+  const LEGACY_SCENE_FORMAT = 'mechanics-lab-scene';
+  const MAX_OBJECTS = 200;                     // guard against pathological scenes
+  const MAX_SCENE_FILE_BYTES = 24 * 1024 * 1024;
 
   /* ------------------------------------------------------------------------
      Main application
@@ -311,6 +509,7 @@
       this.suppressClick = false;
       this.history = new Map();
       this.trails = new Map();
+      this.dyingTrails = [];
       this.trailColorTick = 0;
       this.historyTick = 0;
       this.chartTimer = 0;
@@ -341,6 +540,7 @@
       this.bindCanvasEvents();
       this.bindPanelEvents();
       this.bindKeyboard();
+      this.bindLifecycle();
 
       this.loadPreset('demo', { silent: true });
       this.openPanel('objects', { silent: true });
@@ -528,7 +728,9 @@
           ${ICONS.help}
           <span>帮助</span>
         </button>
-        <div class="toolbar-mark"><span>MECH</span><span>LAB</span></div>
+        <div class="toolbar-mark" title="${APP_NAME} v${APP_VERSION}">
+          <span>MECH</span><span>LAB</span><span class="toolbar-version">v${APP_VERSION}</span>
+        </div>
       `;
 
       this.toolbar.addEventListener('click', (event) => {
@@ -582,18 +784,6 @@
       });
       document.getElementById('btnFit').addEventListener('click', () => this.fitView());
 
-      this.dragPointBtn = document.getElementById('btnDragPoint');
-      if (this.dragPointBtn) {
-        this.dragPointBtn.addEventListener('click', () => {
-          this.state.dragAtPoint = !this.state.dragAtPoint;
-          this.updateDragPointUI();
-          this.toast(this.state.dragAtPoint
-            ? '施力点：鼠标按下的位置（拖动会使物体转动）'
-            : '施力点：重心（拖动不会使物体转动）', 1800);
-        });
-      }
-      this.updateDragPointUI();
-
       // Scene import: a hidden file input plus drag & drop onto the canvas.
       this.sceneFileInput = document.getElementById('sceneFileInput');
       if (this.sceneFileInput) {
@@ -631,13 +821,27 @@
     }
 
     updateDragPointUI() {
-      const button = this.dragPointBtn;
-      if (!button) return;
       const on = Boolean(this.state.dragAtPoint);
-      button.classList.toggle('is-on', on);
-      button.setAttribute('aria-pressed', on ? 'true' : 'false');
-      const label = button.querySelector('#dragPointText');
-      if (label) label.textContent = on ? '指针' : '重心';
+      const buttons = this.panelBody
+        ? [...this.panelBody.querySelectorAll('[data-action="set-drag-point"]')]
+        : [];
+      for (const button of buttons) {
+        const active = (button.dataset.value === 'pointer') === on;
+        button.classList.toggle('is-active', active);
+        button.setAttribute('aria-pressed', active ? 'true' : 'false');
+      }
+    }
+
+    setDragPointMode(atPointer, options = {}) {
+      const next = Boolean(atPointer);
+      if (this.state.dragAtPoint === next) return;
+      this.state.dragAtPoint = next;
+      this.updateDragPointUI();
+      if (!options.silent) {
+        this.toast(next
+          ? '施力点：鼠标按下的位置（拖动会使物体转动）'
+          : '施力点：重心（拖动不会使物体转动）', 1800);
+      }
     }
 
     bindPanelEvents() {
@@ -668,6 +872,34 @@
 
     bindKeyboard() {
       document.addEventListener('keydown', this._keydown);
+    }
+
+    /* Pause and release the animation loop when the tab is hidden; resume on
+       return. Also stop the loop on unload so the page leaves nothing running. */
+    bindLifecycle() {
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+          this._resumeAfterHidden = this.state.running;
+          if (this.state.running) this.pauseSimulation();
+          if (this.raf) cancelAnimationFrame(this.raf);
+          this.raf = 0;
+          return;
+        }
+        this.lastTime = performance.now();
+        this.accumulator = 0;
+        if (this._resumeAfterHidden && !this.state.running) {
+          this.startSimulation();
+        }
+        this._resumeAfterHidden = false;
+        if (!this.raf) this.raf = requestAnimationFrame(this._frame);
+      });
+
+      window.addEventListener('beforeunload', () => {
+        if (this.raf) cancelAnimationFrame(this.raf);
+        this.raf = 0;
+        if (this.resizeObserver) this.resizeObserver.disconnect();
+        this.pauseSimulation();
+      });
     }
 
     onKeyDown(event) {
@@ -1086,7 +1318,11 @@
       const entity = this.entities.get(id);
       if (!entity || entity._removing) return;
       entity._removing = true;
-      this.trails.delete(id);
+      const fading = this.trails.get(id);
+      if (fading) {
+        this.trails.delete(id);
+        this.dyingTrails.push(fading);
+      }
       for (const point of [...this.entities.values()]) {
         if (point.kind === 'point' && point.hostKind === 'entity' && point.hostId === id) {
           this.removeEntity(point.id);
@@ -1246,6 +1482,15 @@
      */
     getRopeDisplayPath(conn, excludePointId = null) {
       if (!conn) return null;
+      const cache = this.ropePathCache;
+      const cacheKey = `${conn.id}:${excludePointId || ''}`;
+      if (cache && cache.has(cacheKey)) return cache.get(cacheKey);
+      const result = this.computeRopeDisplayPath(conn, excludePointId);
+      if (cache) cache.set(cacheKey, result);
+      return result;
+    }
+
+    computeRopeDisplayPath(conn, excludePointId = null) {
       const entities = this.getRopePathEntities(conn);
       const paired = [];
       for (const entity of entities) {
@@ -1912,7 +2157,7 @@
     clearScene(options = {}) {
       this.endForceDrag();
       this.clearHistory();
-      this.clearTrails();
+      this.resetTrails();
       this.trailColorTick = 0;
       this.resetEngine();
       this.counters = {
@@ -1998,77 +2243,104 @@
     }
 
     /* ----------------------------------------------------------------------
-       Scene import / export
-       Everything except the transient mouse-drag force is stored, so the file
-       restores the exact moment the user saved: positions, velocities, spins,
-       connectors, locks, counters, view, display flags, history and trails.
+       Scene files — schema 1 (stable as of v1.0.0)
+
+       On disk everything is SI and y-up, so a saved file reads like the values
+       shown in the UI: position/velocity in m and m/s with +y upwards, rotation
+       in radians counter-clockwise, time in s. The in-memory simulation uses
+       Matter.js (screen y down, velocity per 1/360 s step), so convert at the
+       boundary only.
+
+       {
+         format: "mechanics-lab.scene", schema: 1,
+         app: { name, version }, savedAt: ISO,
+         world: { gravity, groundFriction },
+         simulation: { time, running, speed, mode, dragAtPoint },
+         view: { camera: {x,y,zoom}, show: {...}, selectedId, panel },
+         naming: { counters, nextId, trailColor },
+         entities: [
+           { type: "block", id, name, mass, friction, size: {w,h}, locked,
+             trail: {visible, color},
+             state: {position:{x,y}, rotation, velocity:{x,y}, spin},
+             home: {position, rotation} | null },
+           { type: "incline", ..., size: {base,h}, orientation },
+           { type: "anchor", id, name, position },
+           { type: "point", id, name, pointType, host:{kind,id}, param, position }
+         ],
+         connectors: [
+           { type, id, name, ends:[idA,idB],
+             parameters: {k, restLength}   // spring / elastic only
+             length,                        // rod / rope only
+             fixed: {a,b,direction|null,sign}, sliders:[ids] }
+         ],
+         history: { hz, window, series: [{id,t,x,y,vx,vy,ax,ay,fx,fy}] },
+         trails: [{ id, color, segments: [flat [x,y,t,...]] }]
+       }
        ---------------------------------------------------------------------- */
 
     serializeScene(options = {}) {
       const withHistory = options.withHistory !== false;
       const state = this.state;
+      const toPos = (p) => ({ x: roundNumber(p.x), y: roundNumber(-p.y) });
+
       const entities = [];
       for (const entity of this.entities.values()) {
         if (entity.kind === 'anchor') {
           entities.push({
+            type: 'anchor',
             id: entity.id,
-            kind: 'anchor',
             name: entity.name,
-            x: roundNumber(entity.x),
-            y: roundNumber(entity.y)
+            position: toPos(entity)
           });
           continue;
         }
         if (entity.kind === 'point') {
           const world = this.getRefPoint(this.refFor(entity)) || { x: 0, y: 0 };
           entities.push({
+            type: 'point',
             id: entity.id,
-            kind: 'point',
-            pointType: entity.pointType,
             name: entity.name,
-            hostKind: entity.hostKind,
-            hostId: entity.hostId,
-            param: roundNumber(entity.param ?? 0),
-            local: entity.local
-              ? { x: roundNumber(entity.local.x), y: roundNumber(entity.local.y) }
-              : null,
+            pointType: entity.pointType === 'slider' ? 'slider' : 'dynamic',
+            host: { kind: entity.hostKind === 'connector' ? 'connector' : 'entity', id: entity.hostId },
+            param: roundNumber(entity.param ?? 0, 5),
             split: Boolean(entity._split),
-            position: { x: roundNumber(world.x), y: roundNumber(world.y) },
-            velocity: entity.proxy
-              ? { x: roundNumber(entity.proxy.velocity.x), y: roundNumber(entity.proxy.velocity.y) }
-              : null
+            position: toPos(world)
           });
           continue;
         }
         const body = entity.body;
         if (!body) continue;
         const item = {
+          type: entity.kind,
           id: entity.id,
-          kind: entity.kind,
           name: entity.name,
           mass: roundNumber(entity.mass),
           friction: roundNumber(entity.friction),
           locked: Boolean(entity.locked),
-          showTrail: entity.showTrail !== false,
-          trailColor: entity.trailColor || null,
-          position: { x: roundNumber(body.position.x), y: roundNumber(body.position.y) },
-          angle: roundNumber(body.angle),
-          velocity: { x: roundNumber(body.velocity.x), y: roundNumber(body.velocity.y) },
-          angularVelocity: roundNumber(body.angularVelocity),
+          trail: {
+            visible: entity.showTrail !== false,
+            color: entity.trailColor || null
+          },
+          state: {
+            position: toPos(body.position),
+            rotation: roundNumber(-body.angle),
+            velocity: {
+              x: roundNumber(body.velocity.x * 60),
+              y: roundNumber(-body.velocity.y * 60)
+            },
+            spin: roundNumber(-body.angularVelocity * 60)
+          },
           home: entity.home
             ? {
-                x: roundNumber(entity.home.x),
-                y: roundNumber(entity.home.y),
-                angle: roundNumber(entity.home.angle || 0)
+                position: toPos(entity.home),
+                rotation: roundNumber(-(entity.home.angle || 0))
               }
             : null
         };
         if (entity.kind === 'block') {
-          item.width = roundNumber(entity.width);
-          item.height = roundNumber(entity.height);
+          item.size = { w: roundNumber(entity.width), h: roundNumber(entity.height) };
         } else {
-          item.base = roundNumber(entity.base);
-          item.height = roundNumber(entity.height);
+          item.size = { base: roundNumber(entity.base), h: roundNumber(entity.height) };
           item.orientation = entity.orientation === 'left' ? 'left' : 'right';
         }
         entities.push(item);
@@ -2076,82 +2348,139 @@
 
       const connectors = [];
       for (const conn of this.connectors.values()) {
-        connectors.push({
-          id: conn.id,
+        const item = {
           type: conn.type,
+          id: conn.id,
           name: conn.name,
-          a: { kind: conn.a.kind, id: conn.a.id },
-          b: { kind: conn.b.kind, id: conn.b.id },
-          k: roundNumber(conn.k),
-          restLength: roundNumber(conn.restLength),
-          length: roundNumber(conn.length),
-          fixedA: Boolean(conn.fixedA),
-          fixedB: Boolean(conn.fixedB),
-          lockDir: conn.lockDir
-            ? { x: roundNumber(conn.lockDir.x), y: roundNumber(conn.lockDir.y) }
-            : null,
-          lockSign: conn._lockSign === -1 ? -1 : 1,
+          ends: [conn.a.id, conn.b.id],
+          fixed: {
+            a: Boolean(conn.fixedA),
+            b: Boolean(conn.fixedB),
+            direction: conn.lockDir
+              ? { x: roundNumber(conn.lockDir.x), y: roundNumber(-conn.lockDir.y) }
+              : null,
+            sign: conn._lockSign === -1 ? -1 : 1
+          },
           sliders: Array.isArray(conn.sliders) ? [...conn.sliders] : []
-        });
+        };
+        if (conn.type === 'spring' || conn.type === 'elastic') {
+          item.parameters = {
+            k: roundNumber(conn.k),
+            restLength: roundNumber(conn.restLength)
+          };
+        } else {
+          item.length = roundNumber(conn.length);
+        }
+        connectors.push(item);
       }
 
       const data = {
-        format: SCENE_FILE_FORMAT,
-        version: SCENE_FILE_VERSION,
+        format: SCENE_FORMAT,
+        schema: SCENE_SCHEMA,
+        app: { name: APP_NAME, version: APP_VERSION },
         savedAt: new Date().toISOString(),
-        state: {
-          mode: state.mode,
+        world: {
+          gravity: roundNumber(state.gravity),
+          groundFriction: roundNumber(state.groundFriction)
+        },
+        simulation: {
+          time: roundNumber(state.simTime, 4),
           running: Boolean(state.running),
-          speed: state.speed,
-          simTime: roundNumber(state.simTime),
-          gravity: state.gravity,
-          groundFriction: state.groundFriction,
-          showForces: Boolean(state.showForces),
-          showVelocity: Boolean(state.showVelocity),
-          showAcceleration: Boolean(state.showAcceleration),
-          showGrid: Boolean(state.showGrid),
-          showTrails: Boolean(state.showTrails),
-          dragAtPoint: Boolean(state.dragAtPoint),
+          speed: [0.25, 0.5, 1, 2].includes(Number(state.speed)) ? Number(state.speed) : 1,
+          mode: state.mode === 'edit' ? 'edit' : 'physics',
+          dragAtPoint: Boolean(state.dragAtPoint)
+        },
+        view: {
+          camera: {
+            x: roundNumber(this.camera.x),
+            y: roundNumber(-this.camera.y),
+            zoom: roundNumber(this.camera.zoom)
+          },
+          show: {
+            forces: Boolean(state.showForces),
+            velocity: Boolean(state.showVelocity),
+            acceleration: Boolean(state.showAcceleration),
+            grid: Boolean(state.showGrid),
+            trails: Boolean(state.showTrails)
+          },
           selectedId: state.selectedId || null,
-          openPanel: state.openPanel || null
+          panel: PANEL_IDS.includes(state.openPanel) ? state.openPanel : null
         },
-        camera: {
-          x: roundNumber(this.camera.x),
-          y: roundNumber(this.camera.y),
-          zoom: roundNumber(this.camera.zoom)
+        naming: {
+          counters: { ...this.counters },
+          nextId: this._idCounter || 0,
+          trailColor: this.trailColorTick || 0
         },
-        counters: { ...this.counters },
-        idCounter: this._idCounter || 0,
-        trailColorTick: this.trailColorTick || 0,
         entities,
         connectors
       };
 
       if (withHistory) {
-        data.history = [];
+        const series = [];
         for (const [id, entry] of this.history) {
+          if (!this.entities.has(id)) continue;
           const record = { id };
           for (const key of HISTORY_KEYS) {
             record[key] = (entry[key] || []).map((value) => roundNumber(value, 5));
           }
-          data.history.push(record);
+          series.push(record);
         }
-        data.trails = [...this.trails].map(([id, trail]) => ({
-          id,
-          color: trail.color,
-          points: trail.points.map((value) => roundNumber(value, 4))
-        }));
+        data.history = { hz: HISTORY_HZ, window: 10, series };
+
+        const trails = [];
+        for (const [id, trail] of this.trails) {
+          if (!this.entities.has(id) || !trail.segments.length) continue;
+          const segments = trail.segments.map((segment) => {
+            const flat = [];
+            for (let i = 0; i < segment.length; i += 3) {
+              flat.push(roundNumber(segment[i], 4), roundNumber(-segment[i + 1], 4), roundNumber(segment[i + 2], 3));
+            }
+            return flat;
+          });
+          trails.push({ id, color: trail.color, segments });
+        }
+        data.trails = trails;
       }
       return data;
     }
 
-    /* Rebuild a scene from a serialized object. Throws on malformed input. */
-    restoreSceneData(data) {
-      if (!data || data.format !== SCENE_FILE_FORMAT) {
-        throw new Error('不是力学实验室的场景文件');
+    /* Accepts schema-1 files and the pre-1.0 shape, returns the canonical form. */
+    normalizeSceneFile(input) {
+      if (!input || typeof input !== 'object' || Array.isArray(input)) {
+        throw new Error('文件内容不是场景对象');
       }
-      if (!Array.isArray(data.entities) || !Array.isArray(data.connectors)) {
-        throw new Error('场景文件缺少 objects 数据');
+      if (input.format === SCENE_FORMAT) {
+        const schema = Number(input.schema);
+        if (!Number.isInteger(schema) || schema < 1) throw new Error('缺少有效的 schema 版本号');
+        if (schema > SCENE_SCHEMA) {
+          throw new Error(`文件版本 ${schema} 高于当前支持的 ${SCENE_SCHEMA}，请更新页面`);
+        }
+        if (!Array.isArray(input.entities)) throw new Error('场景文件缺少 entities');
+        return input;
+      }
+      if (input.format === LEGACY_SCENE_FORMAT) return migrateLegacyScene(input);
+      throw new Error('不是力学实验室的场景文件');
+    }
+
+    /* Rebuild the scene from a file object (schema 1 or legacy). */
+    restoreSceneData(input) {
+      const data = this.normalizeSceneFile(input);
+      const world = data.world || {};
+      const sim = data.simulation || {};
+      const view = data.view || {};
+      const show = view.show || {};
+      const naming = data.naming || {};
+      const sceneEntities = Array.isArray(data.entities) ? data.entities : [];
+      const sceneConnectors = Array.isArray(data.connectors) ? data.connectors : [];
+
+      if (sceneEntities.length > MAX_OBJECTS) {
+        throw new Error(`物体数量 ${sceneEntities.length} 超过上限 ${MAX_OBJECTS}`);
+      }
+      const seenIds = new Set();
+      for (const item of sceneEntities) {
+        if (!item || !item.id) continue;
+        if (seenIds.has(item.id)) throw new Error(`物体 id 重复：${item.id}`);
+        seenIds.add(item.id);
       }
 
       this.pauseSimulation();
@@ -2160,44 +2489,55 @@
       this.trailColorTick = 0;
       this._idCounter = 0;
 
-      // --- 1. global parameters -------------------------------------------------
-      const saved = data.state || {};
-      this.state.gravity = clamp(Number(saved.gravity ?? 9.8), 0, 20);
+      // --- world + clock -------------------------------------------------------
+      this.state.gravity = clamp(Number(world.gravity ?? 9.8), 0, 20);
       this.engine.gravity.y = this.state.gravity;
-      this.state.groundFriction = clamp(Number(saved.groundFriction ?? 0.5), 0, 5);
-      this.state.simTime = Math.max(0, Number(saved.simTime) || 0);
+      this.state.groundFriction = clamp(Number(world.groundFriction ?? 0.5), 0, 5);
+      this.state.simTime = Math.max(0, Number(sim.time) || 0);
 
-      // --- 2. anchors and bodies ------------------------------------------------
-      for (const item of data.entities) {
+      const toWorld = (p) => ({
+        x: clamp(num(p?.x), -1e4, 1e4),
+        y: clamp(-num(p?.y), -1e4, 1e4)
+      });
+      const toAngle = (rotation) => clamp(-num(rotation), -1e5, 1e5);
+      const toVel = (v) => ({
+        x: clamp(num(v?.x), -1e5, 1e5) / 60,
+        y: clamp(-num(v?.y), -1e5, 1e5) / 60
+      });
+
+      // --- pass 1: anchors, blocks, inclines -----------------------------------
+      for (const item of sceneEntities) {
         if (!item || !item.id) continue;
-        if (item.kind === 'anchor') {
+        if (item.type === 'anchor') {
+          const p = toWorld(item.position);
           this.entities.set(item.id, {
             id: item.id,
             kind: 'anchor',
             name: item.name || '锚点',
-            x: Number(item.x) || 0,
-            y: Number(item.y) || 0,
+            x: p.x,
+            y: p.y,
             proxy: null,
             home: null
           });
           continue;
         }
-        if (item.kind === 'point') continue;   // second pass, needs connectors
-        if (item.kind !== 'block' && item.kind !== 'incline') {
-          throw new Error(`未知的物体类型：${item.kind}`);
+        if (item.type === 'point') continue;   // needs its host / connector first
+        if (item.type !== 'block' && item.type !== 'incline') {
+          throw new Error(`未知的物体类型：${item.type}`);
         }
-        const entity = item.kind === 'block'
+        const size = item.size || {};
+        const entity = item.type === 'block'
           ? {
               id: item.id,
               kind: 'block',
               name: item.name || '物块',
               mass: clamp(Number(item.mass) || 1, 0.001, 100),
-              width: clamp(Number(item.width) || 0.8, 0.1, 5),
-              height: clamp(Number(item.height) || 0.5, 0.1, 5),
+              width: clamp(Number(size.w) || 0.8, 0.1, 5),
+              height: clamp(Number(size.h) || 0.5, 0.1, 5),
               friction: clamp(Number(item.friction ?? 0.3), 0, 5),
               locked: Boolean(item.locked),
-              showTrail: item.showTrail !== false,
-              trailColor: item.trailColor || null,
+              showTrail: item.trail?.visible !== false,
+              trailColor: item.trail?.color || null,
               body: null,
               home: null
             }
@@ -2206,58 +2546,78 @@
               kind: 'incline',
               name: item.name || '斜面',
               mass: clamp(Number(item.mass) || 10, 0.001, 100),
-              base: clamp(Number(item.base) || 3, 0.1, 5),
-              height: clamp(Number(item.height) || 1.5, 0.1, 5),
+              base: clamp(Number(size.base) || 3, 0.1, 5),
+              height: clamp(Number(size.h) || 1.5, 0.1, 5),
               friction: clamp(Number(item.friction ?? 0.4), 0, 5),
               orientation: item.orientation === 'left' ? 'left' : 'right',
               locked: Boolean(item.locked),
-              showTrail: item.showTrail !== false,
-              trailColor: item.trailColor || null,
+              showTrail: item.trail?.visible !== false,
+              trailColor: item.trail?.color || null,
               body: null,
               home: null
             };
         this.entities.set(entity.id, entity);
+        const state = item.state || {};
+        const pos = toWorld(state.position || { x: 0, y: -1 });
+        const angle = toAngle(state.rotation);
         if (entity.kind === 'block') {
-          this.buildBlockBody(entity, item.position || { x: 0, y: -1 }, Number(item.angle) || 0);
+          this.buildBlockBody(entity, pos, angle);
         } else {
           this.buildInclineBody(entity, 0, 0, 0);
-          this.Body.setPosition(entity.body, item.position || { x: 0, y: -1 });
-          this.Body.setAngle(entity.body, Number(item.angle) || 0);
+          this.Body.setPosition(entity.body, pos);
+          this.Body.setAngle(entity.body, angle);
         }
-        if (item.home) {
-          entity.home = {
-            x: Number(item.home.x),
-            y: Number(item.home.y),
-            angle: Number(item.home.angle) || 0
-          };
+        if (item.home && item.home.position) {
+          const home = toWorld(item.home.position);
+          entity.home = { x: home.x, y: home.y, angle: toAngle(item.home.rotation) };
         }
       }
 
-      // Anchors need their static proxy bodies once the map is populated.
       for (const entity of this.entities.values()) {
         if (entity.kind === 'anchor') this.buildAnchorProxy(entity);
       }
 
-      // --- 3. connectors (endpoints may be points created below) ----------------
-      for (const item of data.connectors) {
-        if (!item || !item.id || !CONNECTOR_INFO[item.type]) continue;
+      // --- pass 2: connectors ---------------------------------------------------
+      // Points are created in pass 3, but a connector may already end at one
+      // (for example a rope split at a relay node), so accept planned point ids.
+      const plannedPoints = new Set();
+      for (const item of sceneEntities) {
+        if (item && item.type === 'point' && item.id) plannedPoints.add(item.id);
+      }
+      const endpointExists = (id) => this.entities.has(id) || plannedPoints.has(id);
+      const kindForEndpoint = (id) => (plannedPoints.has(id) ? 'point' : this.refKindFor(id));
+
+      let skippedConnectors = 0;
+      for (const item of sceneConnectors) {
+        if (!item || !item.id || !CONNECTOR_INFO[item.type] || !Array.isArray(item.ends)) {
+          skippedConnectors += 1;
+          continue;
+        }
+        const [idA, idB] = item.ends;
+        if (!endpointExists(idA) || !endpointExists(idB) || idA === idB) {
+          skippedConnectors += 1;
+          continue;
+        }
+        const fixed = item.fixed || {};
+        const direction = fixed.direction
+          ? normalize({ x: Number(fixed.direction.x) || 0, y: -(Number(fixed.direction.y) || 0) }, { x: 0, y: -1 })
+          : null;
+        const parameters = item.parameters || {};
         const conn = {
           id: item.id,
           kind: 'connector',
           type: item.type,
           name: item.name || CONNECTOR_INFO[item.type].label,
-          a: { ...item.a },
-          b: { ...item.b },
-          k: clamp(Number(item.k) || 30, 1, 100000),
-          restLength: clamp(Number(item.restLength) || 1, 0.05, 20),
+          a: { kind: kindForEndpoint(idA), id: idA },
+          b: { kind: kindForEndpoint(idB), id: idB },
+          k: clamp(Number(parameters.k) || 30, 1, 100000),
+          restLength: clamp(Number(parameters.restLength) || 1, 0.05, 20),
           length: clamp(Number(item.length) || 1, 0.05, 20),
-          fixedA: Boolean(item.fixedA),
-          fixedB: Boolean(item.fixedB),
+          fixedA: Boolean(fixed.a),
+          fixedB: Boolean(fixed.b),
           sliders: [],
-          lockDir: item.lockDir
-            ? normalize({ x: Number(item.lockDir.x) || 0, y: Number(item.lockDir.y) || -1 }, { x: 0, y: -1 })
-            : null,
-          _lockSign: item.lockSign === -1 ? -1 : 1,
+          lockDir: direction,
+          _lockSign: fixed.sign === -1 ? -1 : 1,
           constraint: null,
           _state: 'neutral'
         };
@@ -2268,39 +2628,47 @@
         this.connectors.set(conn.id, conn);
       }
 
-      // --- 4. points ------------------------------------------------------------
-      for (const item of data.entities) {
-        if (!item || item.kind !== 'point') continue;
+      // --- pass 3: points -------------------------------------------------------
+      for (const item of sceneEntities) {
+        if (!item || item.type !== 'point' || !item.id) continue;
+        const host = item.host || {};
+        const hostKind = host.kind === 'connector' ? 'connector' : 'entity';
+        const hostId = host.id;
+        const isSplit = Boolean(item.split);
+        const hostExists = isSplit ? true : (hostKind === 'connector'
+          ? this.connectors.has(hostId)
+          : this.entities.has(hostId));
+        if (!hostExists) continue;
         const point = {
           id: item.id,
           kind: 'point',
           pointType: item.pointType === 'slider' ? 'slider' : 'dynamic',
           name: item.name || '动点',
-          hostKind: item.hostKind === 'connector' ? 'connector' : 'entity',
-          hostId: item.hostId,
-          param: roundNumber(item.param ?? 0),
-          local: item.local ? { x: Number(item.local.x) || 0, y: Number(item.local.y) || 0 } : null,
+          hostKind,
+          hostId,
+          param: clamp(Number(item.param) || 0, 0, 1),
+          local: null,
           proxy: null,
           home: null,
-          _split: Boolean(item.split)
+          _split: isSplit
         };
+        if (hostKind === 'entity' && !isSplit) {
+          const hostEntity = this.entities.get(hostId);
+          const worldPos = toWorld(item.position || { x: 0, y: 0 });
+          point.local = hostEntity.body
+            ? this.worldToLocal(hostEntity.body, worldPos)
+            : { x: 0, y: 0 };
+        }
         this.entities.set(point.id, point);
-        const needsProxy = point.pointType === 'slider' || point._split;
+        const needsProxy = point.pointType === 'slider' || isSplit;
         if (needsProxy) {
-          this.buildPointProxy(point, item.position || { x: 0, y: 0 });
-          if (item.velocity && point.proxy) {
-            this.Body.setVelocity(point.proxy, {
-              x: Number(item.velocity.x) || 0,
-              y: Number(item.velocity.y) || 0
-            });
-          }
+          this.buildPointProxy(point, toWorld(item.position || { x: 0, y: 0 }));
         }
       }
 
-      // --- 5. slider registration + constraints --------------------------------
-      // Restore the original insertion order so panel lists do not shuffle.
+      // Original order keeps the object list stable after importing.
       const ordered = new Map();
-      for (const item of data.entities) {
+      for (const item of sceneEntities) {
         const entity = item && this.entities.get(item.id);
         if (entity) ordered.set(entity.id, entity);
       }
@@ -2309,89 +2677,117 @@
       }
       this.entities = ordered;
 
-      for (const item of data.connectors) {
+      // --- constraints ----------------------------------------------------------
+      // Drop connectors whose endpoint never materialised (invalid host, etc.).
+      for (const [id, conn] of [...this.connectors]) {
+        if (!this.getRefPoint(conn.a) || !this.getRefPoint(conn.b)) {
+          this.connectors.delete(id);
+          skippedConnectors += 1;
+        }
+      }
+      for (const item of sceneConnectors) {
         const conn = this.connectors.get(item?.id);
         if (!conn || !Array.isArray(item.sliders)) continue;
-        conn.sliders = item.sliders.filter((id) => this.entities.has(id));
+        conn.sliders = item.sliders.filter((id) => {
+          const point = this.entities.get(id);
+          return point && point.kind === 'point' && point.hostKind === 'connector' && point.hostId === conn.id;
+        });
       }
       this.syncAllConnectors();
       for (const conn of this.connectors.values()) {
         if (this.getFixedInfo(conn) && !conn.lockDir) this.ensureLockDir(conn, true);
       }
 
-      // --- 6. per-body runtime state -------------------------------------------
-      for (const item of data.entities) {
-        const entity = this.entities.get(item?.id);
+      // --- per-body velocity ----------------------------------------------------
+      for (const item of sceneEntities) {
+        const entity = item && this.entities.get(item.id);
         if (!entity || !entity.body) continue;
         const body = entity.body;
+        const saved = item.state || {};
         if (!entity.locked) {
-          this.Body.setVelocity(body, {
-            x: Number(item.velocity?.x) || 0,
-            y: Number(item.velocity?.y) || 0
-          });
-          this.Body.setAngularVelocity(body, Number(item.angularVelocity) || 0);
+          this.Body.setVelocity(body, toVel(saved.velocity));
+          this.Body.setAngularVelocity(body, -(Number(saved.spin) || 0) / 60);
         }
         body._accel = { x: 0, y: 0 };
         body._lastV = { x: body.velocity.x * 60, y: body.velocity.y * 60 };
         body._accelTime = this.state.simTime;
       }
 
-      // --- 7. counters, view and display flags ---------------------------------
-      if (data.counters && typeof data.counters === 'object') {
+      // --- naming / view --------------------------------------------------------
+      if (naming.counters && typeof naming.counters === 'object') {
         for (const key of Object.keys(this.counters)) {
-          const value = Number(data.counters[key]);
-          if (Number.isFinite(value) && value >= 0) this.counters[key] = value;
+          const value = Number(naming.counters[key]);
+          if (Number.isFinite(value) && value >= 0) this.counters[key] = Math.floor(value);
         }
       }
-      this._idCounter = Math.max(0, Number(data.idCounter) || 0);
-      this.trailColorTick = Math.max(0, Number(data.trailColorTick) || 0);
+      this._idCounter = Math.max(0, Math.floor(Number(naming.nextId) || 0));
+      this.trailColorTick = Math.max(0, Math.floor(Number(naming.trailColor) || 0));
 
-      this.state.simTime = Math.max(0, Number(saved.simTime) || 0);
-      this.state.speed = [0.25, 0.5, 1, 2].includes(Number(saved.speed)) ? Number(saved.speed) : 1;
-      this.state.showForces = saved.showForces !== false;
-      this.state.showVelocity = Boolean(saved.showVelocity);
-      this.state.showAcceleration = Boolean(saved.showAcceleration);
-      this.state.showGrid = saved.showGrid !== false;
-      this.state.showTrails = saved.showTrails !== false;
-      this.state.dragAtPoint = Boolean(saved.dragAtPoint);
-      this.state.mode = saved.mode === 'edit' ? 'edit' : 'physics';
+      this.state.speed = [0.25, 0.5, 1, 2].includes(Number(sim.speed)) ? Number(sim.speed) : 1;
+      this.state.mode = sim.mode === 'edit' ? 'edit' : 'physics';
+      this.state.dragAtPoint = Boolean(sim.dragAtPoint);
+      this.state.showForces = show.forces !== false;
+      this.state.showVelocity = Boolean(show.velocity);
+      this.state.showAcceleration = Boolean(show.acceleration);
+      this.state.showGrid = show.grid !== false;
+      this.state.showTrails = show.trails !== false;
 
-      const camera = data.camera || {};
+      const camera = view.camera || {};
       this.camera.x = Number(camera.x) || 0;
-      this.camera.y = Number(camera.y) || 0;
+      this.camera.y = -(Number(camera.y) || 0);
       this.camera.zoom = clamp(Number(camera.zoom) || 1, ZOOM_MIN, ZOOM_MAX);
-      // --- 8. history and trails -----------------------------------------------
+
+      // --- history + trails -----------------------------------------------------
       this.history.clear();
-      this.trails.clear();
-      for (const record of Array.isArray(data.history) ? data.history : []) {
-        if (!record || !this.entities.has(record.id)) continue;
+      this.resetTrails();
+      const history = data.history && Array.isArray(data.history.series) ? data.history.series : [];
+      for (const record of history) {
+        if (!record || !record.id || !this.entities.has(record.id)) continue;
         const entry = {};
         for (const key of HISTORY_KEYS) {
-          entry[key] = Array.isArray(record[key])
-            ? record[key].map((value) => Number(value) || 0)
-            : [];
+          const values = Array.isArray(record[key]) ? record[key] : [];
+          entry[key] = values
+            .slice(0, HISTORY_MAX)
+            .map((value) => (Number.isFinite(Number(value)) ? Number(value) : 0));
         }
         const size = entry.t.length;
         for (const key of HISTORY_KEYS) if (entry[key].length > size) entry[key].length = size;
-        this.history.set(record.id, entry);
+        if (size) this.history.set(record.id, entry);
       }
-      for (const trail of Array.isArray(data.trails) ? data.trails : []) {
-        if (!trail || !this.entities.has(trail.id) || !Array.isArray(trail.points)) continue;
-        const points = trail.points.map((value) => Number(value) || 0);
-        if (points.length < 2) continue;
-        this.trails.set(trail.id, {
-          color: trail.color || this.entities.get(trail.id).trailColor || '#d9d9d9',
-          points
+
+      const trails = Array.isArray(data.trails) ? data.trails : [];
+      for (const item of trails) {
+        if (!item || !this.entities.has(item.id) || !Array.isArray(item.segments)) continue;
+        const segments = [];
+        let total = 0;
+        for (const raw of item.segments) {
+          if (!Array.isArray(raw) || raw.length < 3) continue;
+          const flat = [];
+          for (let i = 0; i + 2 < raw.length; i += 3) {
+            flat.push(
+              Number(raw[i]) || 0,
+              -(Number(raw[i + 1]) || 0),
+              Number(raw[i + 2]) || 0
+            );
+          }
+          total += flat.length / 3;
+          if (total > TRAIL_MAX_POINTS) break;
+          segments.push(flat);
+        }
+        if (!segments.length) continue;
+        this.trails.set(item.id, {
+          color: item.color || this.entities.get(item.id).trailColor || TRAIL_COLORS[0],
+          segments,
+          fade: 1,
+          target: 1
         });
       }
 
-      // --- 9. UI ----------------------------------------------------------------
-      this.state.selectedId = saved.selectedId && (
-        this.entities.has(saved.selectedId) || this.connectors.has(saved.selectedId)
-      ) ? saved.selectedId : null;
-      if (saved.openPanel && PANEL_IDS.includes(saved.openPanel)) {
-        this.state.openPanel = saved.openPanel;
-      }
+      // --- UI -------------------------------------------------------------------
+      this.state.selectedId = view.selectedId && (
+        this.entities.has(view.selectedId) || this.connectors.has(view.selectedId)
+      ) ? view.selectedId : null;
+      if (PANEL_IDS.includes(view.panel)) this.state.openPanel = view.panel;
       this.accumulator = 0;
       this.lastTime = performance.now();
       this.updateModeUI();
@@ -2403,7 +2799,19 @@
       this.updateLiveReadouts(true);
       if (this.state.openPanel) this.renderPanel();
       // Resume running scenes, but keep edit mode paused exactly as saved.
-      if (saved.running && this.state.mode !== 'edit') this.startSimulation();
+      if (sim.running && this.state.mode !== 'edit') this.startSimulation();
+      if (skippedConnectors) {
+        console.warn(`[scene] 跳过 ${skippedConnectors} 个无效连接件`);
+      }
+      return { entities: this.entities.size, connectors: this.connectors.size, skippedConnectors };
+    }
+
+    refKindFor(id) {
+      const entity = this.entities.get(id);
+      if (!entity) return 'body';
+      if (entity.kind === 'anchor') return 'anchor';
+      if (entity.kind === 'point') return 'point';
+      return 'body';
     }
 
     exportScene() {
@@ -2427,31 +2835,49 @@
     }
 
     /* Parse + apply, rolling back to the current scene if anything fails. */
-    applySceneData(data) {
+    applySceneData(input) {
+      let data;
+      try {
+        data = this.normalizeSceneFile(input);
+      } catch (error) {
+        this.toast(`导入失败：${error.message}`, 3400);
+        return false;
+      }
       const backup = this.serializeScene({ withHistory: true });
       try {
-        this.restoreSceneData(data);
-        this.toast('场景已导入');
+        const result = this.restoreSceneData(data);
+        this.toast(`场景已导入：${result.entities} 个物体 · ${result.connectors} 个连接件`, 2400);
         return true;
       } catch (error) {
         try {
           this.restoreSceneData(backup);
         } catch (nested) {
           this.clearScene({ silent: true });
+          console.error('[scene] 回滚失败', nested);
         }
-        this.toast(`导入失败：${error.message}`, 3200);
+        this.toast(`导入失败：${error.message}`, 3400);
+        console.warn('[scene] 导入失败：', error.message);
         return false;
       }
     }
 
     async importSceneFile(file) {
       if (!file) return false;
+      if (file.size > MAX_SCENE_FILE_BYTES) {
+        this.toast(`导入失败：文件超过 ${Math.round(MAX_SCENE_FILE_BYTES / 1024 / 1024)} MB`, 3400);
+        return false;
+      }
       try {
         const text = await file.text();
-        const data = JSON.parse(text);
-        return this.applySceneData(data);
+        let parsed;
+        try {
+          parsed = JSON.parse(text);
+        } catch (error) {
+          throw new Error('JSON 解析失败，文件可能已损坏');
+        }
+        return this.applySceneData(parsed);
       } catch (error) {
-        this.toast(`导入失败：${error.message}`, 3200);
+        this.toast(`导入失败：${error.message}`, 3400);
         return false;
       }
     }
@@ -2491,6 +2917,7 @@
     }
 
     addBlockInteractive() {
+      if (!this.canAddObject()) return;
       this.ensureEditMode();
       const width = 0.8;
       const height = 0.5;
@@ -2503,6 +2930,7 @@
     }
 
     addInclineInteractive() {
+      if (!this.canAddObject()) return;
       this.ensureEditMode();
       const base = 3;
       const height = 1.5;
@@ -2515,6 +2943,7 @@
     }
 
     addAnchorInteractive() {
+      if (!this.canAddObject()) return;
       this.ensureEditMode();
       let x = this.camera.x;
       let y = this.camera.y;
@@ -2524,7 +2953,18 @@
       this.toast('已添加锚点；固定方向请在硬杆/弹簧属性中按端点设置');
     }
 
+    canAddObject() {
+      const total = this.entities.size + this.connectors.size;
+      if (total >= MAX_OBJECTS) {
+        this.toast(`场景对象已达上限（${MAX_OBJECTS} 个），请先删除一些`, 3000);
+        return false;
+      }
+      return true;
+    }
+
     startConnectorPick(type) {
+      if (!CONNECTOR_INFO[type]) return;
+      if (!this.canAddObject()) return;
       this.ensureEditMode();
       this.state.pendingConnector = { type, first: null };
       this.state.selectedId = null;
@@ -2966,6 +3406,7 @@
       }
 
       this.render(now);
+      this.updateTrails(elapsed);
 
       if (now - this.liveTimer > 90) {
         this.liveTimer = now;
@@ -3338,10 +3779,7 @@
         const vy = -velocity.y;
         let entry = this.history.get(entity.id);
         if (!entry) {
-          entry = {
-            t: [], v: [], a: [],
-            vx: [], vy: [], ax: [], ay: [], fx: [], fy: [], x: [], y: []
-          };
+          entry = { t: [], vx: [], vy: [], ax: [], ay: [], fx: [], fy: [], x: [], y: [] };
           this.history.set(entity.id, entry);
         }
         let ax = 0;
@@ -3357,8 +3795,6 @@
         body._histVx = vx;
         body._histVy = vy;
         entry.t.push(t);
-        entry.v.push(Math.hypot(vx, vy));
-        entry.a.push(Math.hypot(ax, ay));
         entry.vx.push(vx);
         entry.vy.push(vy);
         entry.ax.push(ax);
@@ -3368,9 +3804,9 @@
         // Position in the analysis frame: +x right, +y up (screen y is inverted).
         entry.x.push(body.position.x);
         entry.y.push(-body.position.y);
-        this.appendTrail(entity, body.position.x, body.position.y);
+        this.appendTrail(entity, body.position.x, body.position.y, t);
         if (entry.t.length > HISTORY_MAX) {
-          for (const key of ['t', 'v', 'a', 'vx', 'vy', 'ax', 'ay', 'fx', 'fy', 'x', 'y']) {
+          for (const key of HISTORY_KEYS) {
             entry[key].splice(0, 600);
           }
         }
@@ -3397,83 +3833,160 @@
       return color;
     }
 
-    appendTrail(entity, x, y) {
+    /* A trail is a list of segments; each sample stores x, y and time so the
+       oldest part can fade out instead of being cut off abruptly. */
+    appendTrail(entity, x, y, t) {
       let trail = this.trails.get(entity.id);
       if (!trail) {
-        trail = { color: entity.trailColor || this.nextTrailColor(), points: [] };
+        trail = {
+          color: entity.trailColor || this.nextTrailColor(),
+          segments: [],
+          fade: 1,
+          target: 1
+        };
         this.trails.set(entity.id, trail);
       }
-      const pts = trail.points;
-      const n = pts.length;
-      if (n >= 2) {
-        const dx = x - pts[n - 2];
-        const dy = y - pts[n - 1];
-        const dist = Math.hypot(dx, dy);
-        if (dist > TRAIL_BREAK) {
-          // Teleport (edit drag, reset, preset): start a fresh segment.
-          pts.length = 0;
+      let segment = trail.segments[trail.segments.length - 1];
+      const count = segment ? segment.length / 3 : 0;
+      if (count > 0) {
+        const last = segment.length - 3;
+        const lastX = segment[last];
+        const lastY = segment[last + 1];
+        const lastT = segment[last + 2];
+        const dist = Math.hypot(x - lastX, y - lastY);
+        if (dist > TRAIL_BREAK || t - lastT > TRAIL_GAP) {
+          segment = [];
+          trail.segments.push(segment);
         } else if (dist < TRAIL_MIN_STEP) {
+          // Keep the sample's time fresh so a resting body does not look stale.
+          segment[last + 2] = t;
           return;
         }
+      } else {
+        segment = [];
+        trail.segments.push(segment);
       }
-      pts.push(x, y);
-      if (pts.length > TRAIL_MAX_POINTS * 2) {
-        pts.splice(0, pts.length - TRAIL_MAX_POINTS * 2);
+      segment.push(x, y, t);
+
+      // Trim from the oldest end one sample at a time: those samples are drawn
+      // at almost zero alpha, so trimming is invisible.
+      let total = 0;
+      for (const seg of trail.segments) total += seg.length / 3;
+      while (total > TRAIL_MAX_POINTS && trail.segments.length) {
+        const first = trail.segments[0];
+        const excess = total - TRAIL_MAX_POINTS;
+        const available = first.length / 3;
+        const drop = Math.min(excess, available);
+        first.splice(0, drop * 3);
+        total -= drop;
+        if (!first.length) trail.segments.shift();
       }
+    }
+
+    /* Cross-fade trails instead of deleting them on the spot. */
+    updateTrails(dt) {
+      const visible = this.state.showTrails;
+      const step = clamp(TRAIL_FADE_RATE * dt, 0, 1);
+      for (const [id, trail] of this.trails) {
+        const entity = this.entities.get(id);
+        trail.target = visible && entity && entity.showTrail !== false ? 1 : 0;
+        trail.fade += (trail.target - trail.fade) * step;
+        if (trail.target === 0 && trail.fade <= 0.012) {
+          this.trails.delete(id);
+          if (entity) {
+            // Keep the last sliver fading so hiding never pops.
+            trail.fade = 0.012;
+            this.dyingTrails.push(trail);
+          }
+        }
+      }
+      for (let i = this.dyingTrails.length - 1; i >= 0; i -= 1) {
+        const trail = this.dyingTrails[i];
+        trail.fade -= step * 0.9;
+        if (trail.fade <= 0.008) this.dyingTrails.splice(i, 1);
+      }
+      if (this.dyingTrails.length > 48) this.dyingTrails.length = 48;
     }
 
     clearTrail(id) {
+      const trail = this.trails.get(id);
+      if (!trail) return;
       this.trails.delete(id);
+      trail.target = 0;
+      this.dyingTrails.push(trail);
     }
 
     clearTrails() {
+      for (const [id, trail] of this.trails) {
+        trail.target = 0;
+        this.dyingTrails.push(trail);
+      }
       this.trails.clear();
     }
 
+    /* Hard reset, used when replacing the whole scene. */
+    resetTrails() {
+      this.trails.clear();
+      this.dyingTrails.length = 0;
+    }
+
     drawTrails() {
-      if (!this.state.showTrails) return;
+      if (!this.trails.size && !this.dyingTrails.length) return;
       const ctx = this.ctx;
-      let drew = false;
-      for (const entity of this.entities.values()) {
-        if (!entity.body || entity.showTrail === false) continue;
-        const trail = this.trails.get(entity.id);
-        if (!trail || trail.points.length < 8) continue;
-        const pts = trail.points;
-        const count = pts.length / 2;
-        const screens = new Array(count);
-        for (let i = 0; i < count; i += 1) {
-          screens[i] = this.worldToScreen(pts[i * 2], pts[i * 2 + 1]);
-        }
-        // Older part of the path fades out, the newest part is brightest.
-        const chunks = [
-          { from: 0, to: Math.floor(count * 0.55), alpha: 0.22 },
-          { from: Math.floor(count * 0.55), to: Math.floor(count * 0.85), alpha: 0.4 },
-          { from: Math.floor(count * 0.85), to: count - 1, alpha: 0.62 }
-        ];
-        ctx.save();
-        ctx.lineJoin = 'round';
-        ctx.lineCap = 'round';
-        ctx.lineWidth = 1.25;
-        ctx.strokeStyle = trail.color;
-        for (const chunk of chunks) {
-          if (chunk.to <= chunk.from) continue;
-          ctx.globalAlpha = chunk.alpha;
+      ctx.save();
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.lineWidth = 1.25;
+      for (const [id, trail] of this.trails) {
+        this.drawTrail(ctx, trail, this.state.selectedId === id);
+      }
+      for (const trail of this.dyingTrails) this.drawTrail(ctx, trail, false);
+      ctx.globalAlpha = 1;
+      ctx.restore();
+    }
+
+    drawTrail(ctx, trail, selected) {
+      const alpha = trail.fade;
+      if (alpha <= 0.01 || !trail.segments.length) return;
+      const newest = trail.segments[trail.segments.length - 1];
+      if (!newest || newest.length < 6) return;
+      // Fade window measured in simulation seconds over the retained samples.
+      let oldestT = Infinity;
+      for (const seg of trail.segments) if (seg.length) oldestT = Math.min(oldestT, seg[2]);
+      if (!Number.isFinite(oldestT)) return;
+      const span = Math.max(1e-3, newest[newest.length - 1] - oldestT);
+      const fadeSpan = Math.min(TRAIL_HEAD_FADE, Math.max(0.35, span * 0.4));
+      ctx.strokeStyle = trail.color;
+      for (const segment of trail.segments) {
+        const n = segment.length / 3;
+        if (n < 2) continue;
+        // Draw in a handful of alpha buckets so the whole trail fades smoothly
+        // without issuing one stroke per sample.
+        const buckets = Math.min(12, Math.max(1, Math.ceil(n / 24)));
+        const perBucket = Math.max(1, Math.ceil((n - 1) / buckets));
+        for (let start = 0; start < n - 1; start += perBucket) {
+          const end = Math.min(n - 1, start + perBucket);
+          const rel = clamp((segment[start * 3 + 2] - oldestT) / fadeSpan, 0, 1);
+          // Newest part stays bright; the oldest tail disappears into the black.
+          ctx.globalAlpha = alpha * (0.10 + 0.90 * rel * rel);
           ctx.beginPath();
-          ctx.moveTo(screens[chunk.from].x, screens[chunk.from].y);
-          for (let i = chunk.from + 1; i <= chunk.to; i += 1) {
-            ctx.lineTo(screens[i].x, screens[i].y);
+          const sx = this.worldToScreen(segment[start * 3], segment[start * 3 + 1]);
+          ctx.moveTo(sx.x, sx.y);
+          for (let i = start + 1; i <= end; i += 1) {
+            const p = this.worldToScreen(segment[i * 3], segment[i * 3 + 1]);
+            ctx.lineTo(p.x, p.y);
           }
           ctx.stroke();
-          drew = true;
         }
-        ctx.globalAlpha = 0.85;
+      }
+      if (alpha > 0.5) {
+        const tip = this.worldToScreen(newest[newest.length - 3], newest[newest.length - 2]);
+        ctx.globalAlpha = alpha * (selected ? 1 : 0.9);
         ctx.fillStyle = trail.color;
         ctx.beginPath();
-        ctx.arc(screens[count - 1].x, screens[count - 1].y, 1.8, 0, Math.PI * 2);
+        ctx.arc(tip.x, tip.y, selected ? 2.4 : 1.9, 0, Math.PI * 2);
         ctx.fill();
-        ctx.restore();
       }
-      if (drew) ctx.globalAlpha = 1;
     }
 
     prepareConnectorForces() {
@@ -4029,8 +4542,11 @@
         case 'forces':
           html = this.renderForcesPanel();
           break;
-        case 'scene':
-          html = this.renderScenePanel();
+        case 'settings':
+          html = this.renderSettingsPanel();
+          break;
+        case 'file':
+          html = this.renderFilePanel();
           break;
         case 'display':
           html = this.renderDisplayPanel();
@@ -4051,6 +4567,7 @@
       this.forceRows = null;
       this.forceRowKey = '';
       this.bindRenderedControls();
+      this.updateDragPointUI();
       if (preserveScroll) {
         this.panelBody.scrollTop = scroll;
       }
@@ -4522,32 +5039,9 @@
       `;
     }
 
-    renderScenePanel() {
-      const counts = {
-        bodies: [...this.entities.values()].filter((e) => e.kind !== 'anchor').length,
-        anchors: [...this.entities.values()].filter((e) => e.kind === 'anchor').length,
-        links: this.connectors.size
-      };
-      const presets = Object.entries(PRESET_INFO).map(([id, info]) => `
-        <button type="button" class="preset-btn" data-action="load-preset" data-preset="${id}">
-          <span><strong>${info.label}</strong><small>${info.note}</small></span>
-          <span class="arrow">→</span>
-        </button>
-      `).join('');
-
+    renderSettingsPanel() {
       return `
-        ${this.panelHeader('SCENE / 04', '场景')}
-        <section class="panel-section">
-          <div class="status-line">
-            <span>当前时间</span><strong>${this.state.simTime.toFixed(2)} s</strong>
-          </div>
-          <div class="info-grid">
-            <div class="info-cell"><span>物体</span><strong>${counts.bodies}</strong></div>
-            <div class="info-cell"><span>锚点</span><strong>${counts.anchors}</strong></div>
-            <div class="info-cell"><span>连接件</span><strong>${counts.links}</strong></div>
-            <div class="info-cell"><span>重力 g</span><strong>${this.state.gravity.toFixed(1)} <small>m/s²</small></strong></div>
-          </div>
-        </section>
+        ${this.panelHeader('SETTINGS / 06', '设置')}
         <section class="panel-section">
           <h3 class="section-title">全局参数</h3>
           ${this.fieldHTML({
@@ -4566,15 +5060,55 @@
           <div class="notice">1 m = 100 px。质量、长度、力、速度等读数均使用国际单位。</div>
         </section>
         <section class="panel-section">
-          <h3 class="section-title">演示预设 <span class="section-count">4 SCENES</span></h3>
-          <div class="preset-list">${presets}</div>
+          <h3 class="section-title">交互</h3>
+          <div class="toggle-row stacked">
+            <div class="toggle-copy">
+              <strong>拖拽施力点</strong>
+              <small>物理模式下拖动未锁定的物体时，外力作用在重心就不会让物体旋转；作用在指针按下的位置则会把物体拉得转动起来。</small>
+            </div>
+            <div class="segmented compact" role="group" aria-label="拖拽施力点">
+              <button type="button" data-action="set-drag-point" data-value="com"
+                class="${this.state.dragAtPoint ? '' : 'is-active'}"
+                aria-pressed="${this.state.dragAtPoint ? 'false' : 'true'}">重心</button>
+              <button type="button" data-action="set-drag-point" data-value="pointer"
+                class="${this.state.dragAtPoint ? 'is-active' : ''}"
+                aria-pressed="${this.state.dragAtPoint ? 'true' : 'false'}">指针</button>
+            </div>
+          </div>
+          <div class="notice">直接拖动动点或滑点时，外力始终作用在点本身，不受这里的设置影响。</div>
         </section>
         <section class="panel-section">
-          <h3 class="section-title">导入 / 导出 <span class="section-count">JSON</span></h3>
-          <div class="btn-row">
-            <button type="button" class="btn" data-action="export-scene">导出场景</button>
-            <button type="button" class="btn" data-action="import-scene">导入场景</button>
+          <h3 class="section-title">重置</h3>
+          <button type="button" class="btn wide danger" data-action="clear-scene">清空整个场景</button>
+          <div class="notice">清空后无法恢复。按 <kbd>R</kbd> 只会让物体回到初始位置。</div>
+        </section>
+      `;
+    }
+
+    renderFilePanel() {
+      const presets = Object.entries(PRESET_INFO).map(([id, info]) => `
+        <button type="button" class="preset-btn" data-action="load-preset" data-preset="${id}">
+          <span><strong>${info.label}</strong><small>${info.note}</small></span>
+          <span class="arrow">→</span>
+        </button>
+      `).join('');
+      return `
+        ${this.panelHeader('FILE / 07', '文件')}
+        <section class="panel-section">
+          <h3 class="section-title">演示预设 <span class="section-count">4 SCENES</span></h3>
+          <div class="preset-list">${presets}</div>
+          <div class="notice">载入预设会替换当前场景；需要保留时先导出。</div>
+        </section>
+        <section class="panel-section">
+          <h3 class="section-title">导入 <span class="section-count">JSON</span></h3>
+          <button type="button" class="btn wide" data-action="import-scene">选择场景文件…</button>
+          <div class="notice">
+            也可以把 <code>.json</code> 场景文件直接拖到画布上。导入会替换当前场景；文件无效时保留原场景并给出原因。
           </div>
+        </section>
+        <section class="panel-section">
+          <h3 class="section-title">导出 <span class="section-count">JSON</span></h3>
+          <button type="button" class="btn wide" data-action="export-scene">导出当前场景</button>
           <div class="toggle-row">
             <div class="toggle-copy">
               <strong>包含曲线与轨迹</strong>
@@ -4584,13 +5118,8 @@
               data-action="toggle-export-history" aria-pressed="${this.state.exportHistory}"></button>
           </div>
           <div class="notice">
-            文件保存当前时刻的全部状态：物体位置、速度、自转、连接件与锁定、重力与地面摩擦、显示开关、视角、选中对象，以及曲线和轨迹数据；只有鼠标正在拖拽的外力不保存。导入时也可以把 JSON 文件直接拖到画布上。
+            文件保存当前时刻的全部状态：物体与连接件、位置、速度、自转、锁定、重力与地面摩擦、显示开关、视角、选中对象；只有鼠标正在拖拽的外力不保存。
           </div>
-        </section>
-        <section class="panel-section">
-          <h3 class="section-title">重置</h3>
-          <button type="button" class="btn wide danger" data-action="clear-scene">清空整个场景</button>
-          <div class="notice">清空后无法恢复。按 <kbd>R</kbd> 只会让物体回到初始位置。</div>
         </section>
       `;
     }
@@ -4678,7 +5207,7 @@
       `).join('');
 
       return `
-        ${this.panelHeader('CHARTS / 06', '自动分析')}
+        ${this.panelHeader('CHARTS / 04', '自动分析')}
         <section class="panel-section">
           <h3 class="section-title">分析对象 <span class="section-count">${bodies.length} BODIES</span></h3>
           ${bodies.length ? `<div class="chip-row">${chips}</div>` : '<div class="empty-state">场景中没有可分析的物体。</div>'}
@@ -5194,7 +5723,7 @@
 
     renderHelpPanel() {
       return `
-        ${this.panelHeader('GUIDE / 07', '帮助')}
+        ${this.panelHeader('GUIDE / 08', '帮助')}
         <section class="panel-section">
           <h3 class="section-title">基本操作</h3>
           <ul class="help-list">
@@ -5213,7 +5742,7 @@
             按住任意未锁定的物体、动点或滑点并拖动，就施加一个外力；松手立即撤销。拖动时模拟继续运行，受力箭头、速度和加速度同步更新。
           </div>
           <div class="notice">
-            底部「拖拽 施力点」可切换施力位置：默认<strong>重心</strong>，拖动不会让物体凭空旋转；切到<strong>指针</strong>后，力作用在鼠标按下的那个点上，物体会被拉得转动起来（这是默认关闭的额外模式）。<br>
+            「设置 → 交互 → 拖拽施力点」可切换施力位置：默认<strong>重心</strong>，拖动不会让物体凭空旋转；切到<strong>指针</strong>后，力作用在鼠标按下的那个点上，物体会被拉得转动起来（默认关闭的额外模式）。<br>
             直接拖动<strong>动点</strong>或<strong>滑点</strong>时，外力始终作用在点本身，不受这个设置影响：点会带着宿主物体移动，滑点还会沿轻绳/硬杆滑动。
           </div>
           <div class="notice">
@@ -5247,7 +5776,7 @@
         <section class="panel-section">
           <h3 class="section-title">运动轨迹</h3>
           <div class="section-copy">
-            「显示」面板里的「运动轨迹」会把每个物体质心的路径画在画布上，颜色与物体列表中的色标一致；点击某个物体名可以只隐藏它的轨迹，「清除轨迹」清空全部记录。编辑拖动、重置或切换预设后，旧轨迹会自动断开，不会连出一条假的直线。
+            「显示」面板里的「运动轨迹」会把每个物体质心的路径画在画布上，颜色与物体列表中的色标一致；点击某个物体名可以只隐藏它的轨迹，「清除轨迹」清空全部记录。轨迹的最旧一段会逐渐淡出，超过缓冲上限后也是平滑消隐而不是突然截断；编辑拖动、重置或切换预设后旧轨迹分段保留，不会连出一条假的直线。
           </div>
         </section>
         <section class="panel-section">
@@ -5257,12 +5786,12 @@
           </div>
         </section>
         <section class="panel-section">
-          <h3 class="section-title">导入 / 导出</h3>
+          <h3 class="section-title">文件</h3>
           <div class="section-copy">
-            「场景」面板里的「导出场景」把当前时刻存成一个 JSON 文件；「导入场景」选择该文件即可完整还原，也可以直接把 JSON 文件拖到画布上。导入会替换当前场景，失败时保留原场景。
+            「文件」面板分成三栏：<strong>演示预设</strong>、<strong>导入</strong>、<strong>导出</strong>。「导出当前场景」把当前时刻存成一个 JSON 文件；「选择场景文件…」或直接把 JSON 拖到画布上即可完整还原。导入会替换当前场景，失败时保留原场景。
           </div>
           <div class="notice">
-            文件内容包括物体与连接件、位置、角度、速度、自转、锁定、重力与地面摩擦、显示开关、视角、选中对象和计数器；勾选「包含曲线与轨迹」时还会写入历史采样与运动轨迹。只有鼠标正在拖拽的外力不会被保存。
+            文件（格式 <code>mechanics-lab.scene</code>，schema 1）保存物体与连接件、位置、角度、速度、自转、锁定、重力与地面摩擦、显示开关、视角、选中对象和计数器；勾选「包含曲线与轨迹」时还会写入历史采样与运动轨迹。文件中的数值一律是国际单位、y 轴向上，和界面读数一致。只有鼠标正在拖拽的外力不会被保存。
           </div>
         </section>
         <section class="panel-section">
@@ -5416,7 +5945,7 @@
       if (final) {
         this.renderPanel(true);
         this.updateLiveReadouts(true);
-        if (this.state.openPanel === 'scene' && (field === 'gravity' || field === 'groundFriction')) {
+        if (this.state.openPanel === 'settings' && (field === 'gravity' || field === 'groundFriction')) {
           this.updateLegend();
         }
       }
@@ -5650,6 +6179,9 @@
           if (window.confirm('确定清空整个场景吗？此操作无法撤销。')) {
             this.clearScene();
           }
+          break;
+        case 'set-drag-point':
+          this.setDragPointMode(element.dataset.value === 'pointer');
           break;
         case 'export-scene':
           this.exportScene();
@@ -6159,6 +6691,14 @@
 
     render(now) {
       this.forceFrame += 1;
+      // Per-frame caches: every pass reuses the same body list and rope paths.
+      this.frameBodies = this.frameBodies || [];
+      this.frameBodies.length = 0;
+      for (const entity of this.entities.values()) {
+        if (entity.body) this.frameBodies.push(entity);
+      }
+      this.ropePathCache = this.ropePathCache || new Map();
+      this.ropePathCache.clear();
       const ctx = this.ctx;
       ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
       ctx.clearRect(0, 0, this.width, this.height);
@@ -7034,7 +7574,9 @@
     }
 
     drawVectors() {
-      const bodies = [...this.entities.values()].filter((e) => e.body);
+      const bodies = this.frameBodies && this.frameBodies.length
+        ? this.frameBodies
+        : [...this.entities.values()].filter((e) => e.body);
       if (!bodies.length) {
         this.updateScaleReadout();
         return;
@@ -7387,10 +7929,38 @@
       if (error) error.hidden = false;
       return;
     }
-    window.__mechanicsLab = new window.__MechanicsLab();
+    try {
+      window.__mechanicsLab = new window.__MechanicsLab();
+    } catch (error) {
+      handleFatal(error);
+      return;
+    }
     const loading = document.getElementById('bootLoading');
     if (loading) loading.classList.add('is-hidden');
   }
+
+  /* Surface unexpected runtime failures instead of failing silently. */
+  function handleFatal(error) {
+    console.error('[mechanics-lab]', error);
+    const loading = document.getElementById('bootLoading');
+    if (loading) loading.classList.add('is-hidden');
+    const lab = window.__mechanicsLab;
+    if (lab && typeof lab.toast === 'function') {
+      lab.toast(`出错了：${error && error.message ? error.message : error}`, 5000);
+      return;
+    }
+    const card = document.getElementById('bootError');
+    if (card && card.hidden) {
+      card.hidden = false;
+      const heading = card.querySelector('h2');
+      if (heading) heading.textContent = '启动失败';
+      const copy = card.querySelector('p');
+      if (copy) copy.textContent = `页面初始化时出错：${error && error.message ? error.message : error}`;
+    }
+  }
+
+  window.addEventListener('error', (event) => handleFatal(event.error || event.message));
+  window.addEventListener('unhandledrejection', (event) => handleFatal(event.reason));
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', boot, { once: true });

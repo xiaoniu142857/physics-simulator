@@ -584,6 +584,48 @@ input:focus-visible {
   border-top: 1px solid #171717;
 }
 
+.toolbar-version {
+  margin-top: 4px;
+  color: #2f2f2f;
+  font-size: 7px;
+  letter-spacing: 0.06em;
+}
+
+/* Short viewports: keep all eight tools reachable without clipping. */
+@media (max-height: 760px) {
+  .tool-btn {
+    min-height: 52px;
+    gap: 4px;
+  }
+
+  .tool-btn svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  .tool-btn span {
+    font-size: 9px;
+  }
+
+  .toolbar-mark {
+    padding: 9px 4px;
+  }
+}
+
+@media (max-height: 640px) {
+  .toolbar {
+    overflow-y: auto;
+  }
+
+  .toolbar-spacer {
+    display: none;
+  }
+
+  .toolbar-mark {
+    display: none;
+  }
+}
+
 /* --------------------------------------------------------------------------
    Panel content
    -------------------------------------------------------------------------- */
@@ -836,6 +878,28 @@ input:focus-visible {
 .segmented button.is-active {
   color: #050505;
   background: #efefef;
+}
+
+/* A segmented control that sits under its copy inside a toggle row. */
+.segmented.compact {
+  width: 148px;
+  flex: 0 0 148px;
+}
+
+.segmented.compact button {
+  height: 28px;
+  font-size: 10px;
+}
+
+.toggle-row.stacked {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 9px;
+}
+
+.toggle-row.stacked .segmented.compact {
+  width: 100%;
+  flex: 0 0 auto;
 }
 
 .list {
@@ -1411,7 +1475,7 @@ kbd {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 20px;
+  gap: 16px;
   flex: 0 0 58px;
   height: 58px;
   padding: 0 16px;
@@ -1420,25 +1484,27 @@ kbd {
 }
 
 .transport-left,
-.transport-center,
 .transport-right {
   display: flex;
   align-items: center;
+  min-width: 0;
 }
 
 .transport-left {
   gap: 7px;
-  min-width: 0;
-}
-
-.transport-center {
-  gap: 10px;
 }
 
 .transport-right {
   gap: 16px;
+  margin-left: auto;
   justify-content: flex-end;
-  min-width: 0;
+}
+
+.transport-divider {
+  width: 1px;
+  height: 22px;
+  margin: 0 5px;
+  background: #242424;
 }
 
 .play-btn {
@@ -1496,9 +1562,9 @@ kbd {
   display: flex;
   align-items: baseline;
   gap: 8px;
-  margin-left: 10px;
   padding-left: 15px;
   border-left: 1px solid #252525;
+  white-space: nowrap;
 }
 
 .time-label {
@@ -1519,12 +1585,6 @@ kbd {
   color: #666;
   font-size: 9px;
   font-weight: 400;
-}
-
-.speed-label {
-  color: #5e5e5e;
-  font-size: 9px;
-  letter-spacing: 0.1em;
 }
 
 .speed-group {
@@ -1567,43 +1627,26 @@ kbd {
   color: #8f8f8f;
 }
 
-.shortcut-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px 7px;
-  border: 1px solid #1e1e1e;
-  background: #0b0b0b;
-  color: #6f6f6f;
-  font-family: var(--mono);
-  font-size: 9px;
-  white-space: nowrap;
-  cursor: pointer;
-  border-radius: 0;
+@media (max-width: 1120px) {
+  .shortcut {
+    display: none;
+  }
 }
 
-.shortcut-btn:hover {
-  border-color: #3a3a3a;
-  color: #b9b9b9;
-}
+@media (max-width: 900px) {
+  .transport-divider {
+    display: none;
+  }
 
-.shortcut-btn kbd {
-  color: #8f8f8f;
-}
+  .speed-group button {
+    min-width: 34px;
+    padding: 0 5px;
+  }
 
-.shortcut-btn b {
-  font-weight: 500;
-  color: #d8d8d8;
-}
-
-.shortcut-btn.is-on {
-  border-color: #4a4a4a;
-  background: #161616;
-  color: #e8e8e8;
-}
-
-.shortcut-btn.is-on b {
-  color: #ffab5e;
+  #transport {
+    padding: 0 10px;
+    gap: 10px;
+  }
 }
 
 /* --------------------------------------------------------------------------
@@ -1921,7 +1964,7 @@ kbd {
   }
 
   .transport-right {
-    display: none;
+    gap: 10px;
   }
 }
 
@@ -1952,6 +1995,11 @@ kbd {
   }
 
   .transport-center {
+    display: none;
+  }
+
+  /* Keep the clock readable; the shortcut hints are the first thing to go. */
+  .time-label {
     display: none;
   }
 
