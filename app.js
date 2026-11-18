@@ -1,5 +1,5 @@
 /* ==========================================================================
-   力学实验室 · Mechanics Lab — v1.0.1
+   力学实验室 · Mechanics Lab — v1.1.0
    A browser-based high-school mechanics sandbox built on Matter.js.
 
    Architecture (single bundle, no build step):
@@ -64,9 +64,6 @@
   const TRAIL_MIN_STEP = 0.008;    // metres between samples
   const TRAIL_BREAK = 0.9;         // a jump larger than this starts a new segment
   const TRAIL_GAP = 0.35;          // seconds of missing samples also split segments
-  const TRAIL_HEAD_FADE = 1.8;     // seconds over which the oldest part fades out
-  const TRAIL_TAIL_ALPHA = 0.04;   // opacity right at the trimmed end
-  const TRAIL_FADE_RATE = 6;       // 1/s, show/hide cross-fade speed
 
   /* ------------------------------------------------------------------------
      Small utilities
@@ -412,16 +409,26 @@
   };
 
   const PRESET_INFO = {
-    demo: { label: '综合演示', note: '斜面 + 弹簧振子' },
-    ramp: { label: '斜面滑块', note: '摩擦与斜面' },
-    spring: { label: '弹簧振子', note: '简谐振动' },
-    pendulum: { label: '硬杆摆', note: '定长约束' }
+    demo: { label: '综合演示', note: '斜面 + 弹簧振子', group: '综合' },
+    uniform: { label: '匀速直线运动', note: '无摩擦地面 · 速度恒定', group: '运动学' },
+    freefall: { label: '自由落体', note: 'g = 9.8 m/s²', group: '运动学' },
+    projectile: { label: '平抛运动', note: '水平初速度', group: '运动学' },
+    lob: { label: '斜抛运动', note: '斜向初速度', group: '运动学' },
+    smoothRamp: { label: '光滑斜面', note: '匀加速下滑', group: '运动学' },
+    ramp: { label: '斜面滑块', note: '摩擦与斜面', group: '力学' },
+    stack: { label: '叠放物块', note: '压力与摩擦', group: '力学' },
+    spring: { label: '弹簧振子', note: '简谐振动', group: '力学' },
+    springChain: { label: '弹簧串联', note: '双物块振动', group: '力学' },
+    pendulumRope: { label: '轻绳单摆', note: '不可伸长轻绳', group: '力学' },
+    pendulum: { label: '硬杆摆', note: '定长约束', group: '力学' },
+    atwood: { label: '阿特伍德机', note: '定滑轮联动', group: '力学' },
+    equilibrium: { label: '三力平衡', note: '绳拉斜面滑块', group: '力学' }
   };
 
   const PANEL_IDS = [...TOOL_DEFS.map((tool) => tool.id), 'help'];
 
   const APP_NAME = 'Mechanics Lab';
-  const APP_VERSION = '1.0.1';
+  const APP_VERSION = '1.1.0';
   const SCENE_FORMAT = 'mechanics-lab.scene';
   const SCENE_SCHEMA = 1;
   // Files written before v1.0.0 used this older identifier; they are still read.
@@ -510,7 +517,6 @@
       this.suppressClick = false;
       this.history = new Map();
       this.trails = new Map();
-      this.dyingTrails = [];
       this.trailColorTick = 0;
       this.historyTick = 0;
       this.chartTimer = 0;
@@ -1319,11 +1325,7 @@
       const entity = this.entities.get(id);
       if (!entity || entity._removing) return;
       entity._removing = true;
-      const fading = this.trails.get(id);
-      if (fading) {
-        this.trails.delete(id);
-        this.dyingTrails.push(fading);
-      }
+      this.trails.delete(id);
       for (const point of [...this.entities.values()]) {
         if (point.kind === 'point' && point.hostKind === 'entity' && point.hostId === id) {
           this.removeEntity(point.id);
@@ -2158,7 +2160,7 @@
     clearScene(options = {}) {
       this.endForceDrag();
       this.clearHistory();
-      this.resetTrails();
+      this.clearTrails();
       this.trailColorTick = 0;
       this.resetEngine();
       this.counters = {
@@ -2178,6 +2180,7 @@
     }
 
     loadPreset(name, options = {}) {
+      const key = PRESET_INFO[name] ? name : 'demo';
       this.clearScene({ silent: true });
       this.state.gravity = 9.8;
       this.engine.gravity.y = this.state.gravity;
@@ -2186,49 +2189,7 @@
       this.state.running = false;
       this.updateModeUI();
 
-      if (name === 'ramp') {
-        const ramp = this.createIncline({
-          x: -0.8, base: 3.6, height: 2.0, mass: 14,
-          friction: 0.55, orientation: 'right'
-        });
-        this.blockOnIncline(ramp, 0.27, {
-          mass: 2, width: 0.65, height: 0.45, friction: 0.22
-        });
-      } else if (name === 'spring') {
-        const anchor = this.createAnchor({ x: 0, y: -4.4 });
-        const block = this.createBlock({
-          position: { x: 0, y: -2.7 },
-          mass: 1, width: 0.55, height: 0.55, friction: 0.4
-        });
-        this.createConnector('spring', this.refFor(anchor), this.refFor(block), {
-          k: 28, restLength: 1.05, fixedA: true
-        });
-      } else if (name === 'pendulum') {
-        const anchor = this.createAnchor({ x: 0, y: -4.35 });
-        const block = this.createBlock({
-          position: { x: 1.7, y: -2.65 },
-          mass: 2, width: 0.6, height: 0.6, friction: 0.4
-        });
-        this.createConnector('rod', this.refFor(anchor), this.refFor(block), {
-          length: 2.55
-        });
-      } else {
-        const ramp = this.createIncline({
-          x: -2.2, base: 3.4, height: 1.8, mass: 12,
-          friction: 0.45, orientation: 'right'
-        });
-        this.blockOnIncline(ramp, 0.22, {
-          mass: 1.5, width: 0.55, height: 0.35, friction: 0.12
-        });
-        const anchor = this.createAnchor({ x: 2.55, y: -4.2 });
-        const hanging = this.createBlock({
-          position: { x: 2.55, y: -2.72 },
-          mass: 1, width: 0.55, height: 0.55, friction: 0.4
-        });
-        this.createConnector('spring', this.refFor(anchor), this.refFor(hanging), {
-          k: 30, restLength: 1.05, fixedA: true
-        });
-      }
+      this.buildPresetScene(key);
 
       this.state.selectedId = null;
       this.state.pendingConnector = null;
@@ -2239,7 +2200,204 @@
       this.updateLiveReadouts(true);
       if (this.state.openPanel) this.renderPanel();
       if (!options.silent) {
-        this.toast(`已载入「${PRESET_INFO[name]?.label || '预设'}」`, 1800);
+        this.toast(`已载入「${PRESET_INFO[key]?.label || '预设'}」`, 1800);
+      }
+    }
+
+    /* Body velocity is metres per 1/60 s inside the engine. */
+    setPresetVelocity(entity, vx, vy) {
+      if (!entity || !entity.body) return;
+      this.Body.setVelocity(entity.body, { x: vx / 60, y: vy / 60 });
+    }
+
+    /* One builder per high-school experiment. */
+    buildPresetScene(name) {
+      switch (name) {
+        /* ---------------- 运动学 ---------------- */
+        case 'uniform': {
+          // 匀速直线运动：光滑地面 + 初速度，v–t 为水平直线，x–t 为斜线。
+          this.state.groundFriction = 0;
+          const cart = this.createBlock({
+            position: { x: -4.2, y: -0.25 }, mass: 1, width: 0.8, height: 0.5, friction: 0
+          });
+          this.setPresetVelocity(cart, 2.4, 0);
+          break;
+        }
+        case 'freefall': {
+          // 自由落体：初速度为零，a = g，v–t 斜率等于重力加速度。
+          const ball = this.createBlock({
+            position: { x: 0, y: -8 }, mass: 1, width: 0.4, height: 0.4, friction: 0
+          });
+          this.setPresetVelocity(ball, 0, 0);
+          break;
+        }
+        case 'projectile': {
+          // 平抛运动：水平初速度 + 竖直自由落体，轨迹为抛物线。
+          const stone = this.createBlock({
+            position: { x: -5, y: -7.5 }, mass: 1, width: 0.35, height: 0.35, friction: 0.3
+          });
+          this.setPresetVelocity(stone, 5, 0);
+          break;
+        }
+        case 'lob': {
+          // 斜抛运动：斜向初速度，最高点速度只剩水平分量。
+          const ball = this.createBlock({
+            position: { x: -5.5, y: -1.6 }, mass: 1, width: 0.35, height: 0.35, friction: 0.3
+          });
+          this.setPresetVelocity(ball, 5.5, -6.2);
+          break;
+        }
+        case 'smoothRamp': {
+          // 光滑斜面：沿斜面方向加速度恒定，v–t 为直线。
+          const ramp = this.createIncline({
+            x: 0, base: 4, height: 2.2, mass: 14, friction: 0, orientation: 'right'
+          });
+          this.blockOnIncline(ramp, 0.12, {
+            mass: 2, width: 0.55, height: 0.4, friction: 0
+          });
+          break;
+        }
+
+        /* ---------------- 力学 ---------------- */
+        case 'ramp': {
+          const ramp = this.createIncline({
+            x: -0.8, base: 3.6, height: 2.0, mass: 14,
+            friction: 0.55, orientation: 'right'
+          });
+          this.blockOnIncline(ramp, 0.27, {
+            mass: 2, width: 0.65, height: 0.45, friction: 0.22
+          });
+          break;
+        }
+        case 'stack': {
+          // 叠放物块：下层同时承受上层压力与地面支持力。
+          const lower = this.createBlock({
+            position: { x: 0, y: -0.25 }, mass: 2, width: 1.2, height: 0.5, friction: 0.45
+          });
+          this.createBlock({
+            position: { x: 0, y: -0.75 }, mass: 1, width: 0.7, height: 0.5, friction: 0.45
+          });
+          this.setPresetVelocity(lower, 0.8, 0);
+          break;
+        }
+        case 'spring': {
+          const anchor = this.createAnchor({ x: 0, y: -4.4 });
+          const block = this.createBlock({
+            position: { x: 0, y: -2.7 },
+            mass: 1, width: 0.55, height: 0.55, friction: 0.4
+          });
+          this.createConnector('spring', this.refFor(anchor), this.refFor(block), {
+            k: 28, restLength: 1.05, fixedA: true
+          });
+          break;
+        }
+        case 'springChain': {
+          // 弹簧串联：两个物块的振动互相耦合。
+          const anchor = this.createAnchor({ x: 0, y: -5 });
+          const upper = this.createBlock({
+            position: { x: 0, y: -3.8 }, mass: 0.8, width: 0.45, height: 0.45, friction: 0.4
+          });
+          const lower = this.createBlock({
+            position: { x: 0, y: -2.2 }, mass: 1.2, width: 0.55, height: 0.55, friction: 0.4
+          });
+          this.createConnector('spring', this.refFor(anchor), this.refFor(upper), {
+            k: 40, restLength: 1.1, fixedA: true
+          });
+          this.createConnector('spring', this.refFor(upper), this.refFor(lower), {
+            k: 28, restLength: 1.4
+          });
+          break;
+        }
+        case 'pendulumRope': {
+          // 轻绳单摆：绳只能拉不能推，摆角较大时回到竖直方向。
+          const anchor = this.createAnchor({ x: 0, y: -4.5 });
+          const bob = this.createBlock({
+            position: { x: 1.95, y: -3.3 }, mass: 1.5, width: 0.5, height: 0.5, friction: 0.4
+          });
+          this.createConnector('rope', this.refFor(anchor), this.refFor(bob), {
+            length: 2.35
+          });
+          break;
+        }
+        case 'pendulum': {
+          const anchor = this.createAnchor({ x: 0, y: -4.35 });
+          const block = this.createBlock({
+            position: { x: 1.7, y: -2.65 },
+            mass: 2, width: 0.6, height: 0.6, friction: 0.4
+          });
+          this.createConnector('rod', this.refFor(anchor), this.refFor(block), {
+            length: 2.55
+          });
+          break;
+        }
+        case 'atwood': {
+          // 阿特伍德机：轻绳跨过两个固定在锚点上的滑点，相当于一个定滑轮。
+          // 两端保持竖直，两侧物块分别上升 / 下降。
+          const pegA = this.createAnchor({ x: -0.3, y: -5 });
+          const pegB = this.createAnchor({ x: 0.3, y: -5 });
+          const left = this.createBlock({
+            position: { x: -0.3, y: -3.3 }, mass: 1.5, width: 0.5, height: 0.5, friction: 0.3
+          });
+          const right = this.createBlock({
+            position: { x: 0.3, y: -3.3 }, mass: 1, width: 0.5, height: 0.5, friction: 0.3
+          });
+          const rope = this.createConnector('rope', this.refFor(left), this.refFor(right), {
+            length: 1.7 * 2 + 0.6
+          });
+          if (rope) {
+            const sliders = [pegA, pegB].map((peg) => {
+              const slider = this.createSliderOnConnector(rope, { x: peg.x, y: -4 });
+              if (!slider) return null;
+              this.createConnector('rod', this.refFor(peg), this.refFor(slider), { length: 0.05 });
+              if (slider.proxy) {
+                this.Body.setPosition(slider.proxy, { x: peg.x, y: peg.y });
+                this.Body.setVelocity(slider.proxy, { x: 0, y: 0 });
+              }
+              return slider;
+            });
+            sliders[0].param = 0.2;
+            sliders[1].param = 0.8;
+          }
+          break;
+        }
+        case 'equilibrium': {
+          // 三力平衡：斜面上的滑块被轻绳拉住，重力、支持力、绳拉力与摩擦平衡。
+          const ramp = this.createIncline({
+            x: -1.6, base: 3.2, height: 1.7, mass: 16, friction: 0.35, orientation: 'right'
+          });
+          const block = this.blockOnIncline(ramp, 0.42, {
+            mass: 1.5, width: 0.5, height: 0.35, friction: 0.35
+          });
+          if (block) {
+            const anchor = this.createAnchor({ x: -3.6, y: -2.6 });
+            const span = distance(
+              { x: anchor.x, y: anchor.y },
+              { x: block.body.position.x, y: block.body.position.y }
+            );
+            this.createConnector('rope', this.refFor(anchor), this.refFor(block), {
+              length: Math.max(0.4, span)
+            });
+          }
+          break;
+        }
+        default: {
+          const ramp = this.createIncline({
+            x: -2.2, base: 3.4, height: 1.8, mass: 12,
+            friction: 0.45, orientation: 'right'
+          });
+          this.blockOnIncline(ramp, 0.22, {
+            mass: 1.5, width: 0.55, height: 0.35, friction: 0.12
+          });
+          const anchor = this.createAnchor({ x: 2.55, y: -4.2 });
+          const hanging = this.createBlock({
+            position: { x: 2.55, y: -2.72 },
+            mass: 1, width: 0.55, height: 0.55, friction: 0.4
+          });
+          this.createConnector('spring', this.refFor(anchor), this.refFor(hanging), {
+            k: 30, restLength: 1.05, fixedA: true
+          });
+          break;
+        }
       }
     }
 
@@ -2740,7 +2898,7 @@
 
       // --- history + trails -----------------------------------------------------
       this.history.clear();
-      this.resetTrails();
+      this.clearTrails();
       const history = data.history && Array.isArray(data.history.series) ? data.history.series : [];
       for (const record of history) {
         if (!record || !record.id || !this.entities.has(record.id)) continue;
@@ -2778,9 +2936,7 @@
         if (!segments.length) continue;
         this.trails.set(item.id, {
           color: item.color || this.entities.get(item.id).trailColor || TRAIL_COLORS[0],
-          segments,
-          fade: 1,
-          target: 1
+          segments
         });
       }
 
@@ -3407,7 +3563,6 @@
       }
 
       this.render(now);
-      this.updateTrails(elapsed);
 
       if (now - this.liveTimer > 90) {
         this.liveTimer = now;
@@ -3826,6 +3981,10 @@
 
     /* ----------------------------------------------------------------------
        Motion trails (canvas paths per body)
+
+       A trail is a list of polylines in world space. Segments are split when the
+       body jumps (edit drag, reset, preset) so no fake straight line is drawn.
+       Trails are drawn at full opacity: no fade-in, no gradient, no fade-out.
        ---------------------------------------------------------------------- */
 
     nextTrailColor() {
@@ -3834,17 +3993,10 @@
       return color;
     }
 
-    /* A trail is a list of segments; each sample stores x, y and time so the
-       oldest part can fade out instead of being cut off abruptly. */
     appendTrail(entity, x, y, t) {
       let trail = this.trails.get(entity.id);
       if (!trail) {
-        trail = {
-          color: entity.trailColor || this.nextTrailColor(),
-          segments: [],
-          fade: 0,
-          target: 1
-        };
+        trail = { color: entity.trailColor || this.nextTrailColor(), segments: [] };
         this.trails.set(entity.id, trail);
       }
       let segment = trail.segments[trail.segments.length - 1];
@@ -3859,8 +4011,6 @@
           segment = [];
           trail.segments.push(segment);
         } else if (dist < TRAIL_MIN_STEP) {
-          // Keep the sample's time fresh so a resting body does not look stale.
-          segment[last + 2] = t;
           return;
         }
       } else {
@@ -3869,8 +4019,7 @@
       }
       segment.push(x, y, t);
 
-      // Trim from the oldest end one sample at a time: those samples are drawn
-      // at almost zero alpha, so trimming is invisible.
+      // Drop the oldest samples once the buffer is full.
       let total = 0;
       for (const seg of trail.segments) total += seg.length / 3;
       while (total > TRAIL_MAX_POINTS && trail.segments.length) {
@@ -3884,173 +4033,40 @@
       }
     }
 
-    /* Cross-fade trails instead of deleting them on the spot. */
-    updateTrails(dt) {
-      const visible = this.state.showTrails;
-      const step = clamp(TRAIL_FADE_RATE * dt, 0, 1);
-      for (const [id, trail] of this.trails) {
-        const entity = this.entities.get(id);
-        trail.target = visible && entity && entity.showTrail !== false ? 1 : 0;
-        trail.fade += (trail.target - trail.fade) * step;
-        if (trail.target === 0 && trail.fade <= 0.012) {
-          this.trails.delete(id);
-          if (entity) {
-            // Keep the last sliver fading so hiding never pops.
-            trail.fade = 0.012;
-            this.dyingTrails.push(trail);
-          }
-        }
-      }
-      for (let i = this.dyingTrails.length - 1; i >= 0; i -= 1) {
-        const trail = this.dyingTrails[i];
-        trail.fade -= step * 0.9;
-        if (trail.fade <= 0.008) this.dyingTrails.splice(i, 1);
-      }
-      if (this.dyingTrails.length > 48) this.dyingTrails.length = 48;
-    }
-
     clearTrail(id) {
-      const trail = this.trails.get(id);
-      if (!trail) return;
       this.trails.delete(id);
-      trail.target = 0;
-      this.dyingTrails.push(trail);
     }
 
     clearTrails() {
-      for (const [id, trail] of this.trails) {
-        trail.target = 0;
-        this.dyingTrails.push(trail);
-      }
       this.trails.clear();
-    }
-
-    /* Hard reset, used when replacing the whole scene. */
-    resetTrails() {
-      this.trails.clear();
-      this.dyingTrails.length = 0;
     }
 
     drawTrails() {
-      if (!this.trails.size && !this.dyingTrails.length) return;
+      if (!this.state.showTrails) return;
+      if (!this.trails.size) return;
       const ctx = this.ctx;
       ctx.save();
       ctx.lineJoin = 'round';
       ctx.lineCap = 'butt';
       ctx.lineWidth = 1.25;
       for (const [id, trail] of this.trails) {
-        this.drawTrail(ctx, trail, this.state.selectedId === id);
-      }
-      for (const trail of this.dyingTrails) this.drawTrail(ctx, trail, false);
-      ctx.globalAlpha = 1;
-      ctx.restore();
-    }
-
-    /* Trace one slice of a trail segment with the current stroke style. */
-    traceTrailSlice(ctx, segment, from, to) {
-      if (to <= from) return;
-      const a = this.worldToScreen(segment[from * 3], segment[from * 3 + 1]);
-      ctx.beginPath();
-      ctx.moveTo(a.x, a.y);
-      for (let i = from + 1; i <= to; i += 1) {
-        const p = this.worldToScreen(segment[i * 3], segment[i * 3 + 1]);
-        ctx.lineTo(p.x, p.y);
-      }
-      ctx.stroke();
-    }
-
-    /* '#rrggbb' -> 'rgba(r,g,b,a)'; used where a color must carry its own alpha. */
-    trailTint(color, alpha) {
-      const hex = String(color || '#d9d9d9').replace('#', '');
-      const full = hex.length === 3
-        ? hex.split('').map((c) => c + c).join('')
-        : hex.padEnd(6, '0').slice(0, 6);
-      const r = parseInt(full.slice(0, 2), 16) || 217;
-      const g = parseInt(full.slice(2, 4), 16) || 217;
-      const b = parseInt(full.slice(4, 6), 16) || 217;
-      return `rgba(${r},${g},${b},${clamp(alpha, 0, 1).toFixed(4)})`;
-    }
-
-    /* Paint one trail. The tail is drawn as a few long slices whose stroke is a
-       linear gradient, so the opacity changes continuously per pixel instead of
-       stepping at slice boundaries (which is what made the tail look striped). */
-    drawTrail(ctx, trail, selected) {
-      const fade = trail.fade;
-      if (fade <= 0.01 || !trail.segments.length) return;
-
-      // Time range of everything that is still retained.
-      let oldestT = Infinity;
-      let newestT = -Infinity;
-      for (const seg of trail.segments) {
-        if (seg.length < 3) continue;
-        if (seg[2] < oldestT) oldestT = seg[2];
-        const endT = seg[seg.length - 1];
-        if (endT > newestT) newestT = endT;
-      }
-      if (!Number.isFinite(oldestT) || !Number.isFinite(newestT)) return;
-
-      const span = Math.max(1e-3, newestT - oldestT);
-      const fadeSpan = Math.min(TRAIL_HEAD_FADE, Math.max(0.35, span * 0.4));
-      const floor = TRAIL_TAIL_ALPHA;
-      const alphaAt = (simTime) => {
-        if (fadeSpan <= 1e-6) return 1;
-        const u = clamp((simTime - oldestT) / fadeSpan, 0, 1);
-        const s = u * u * (3 - 2 * u);        // smoothstep: soft head, soft join
-        return floor + (1 - floor) * s;
-      };
-      const tint = (alpha) => this.trailTint(trail.color, clamp(fade * alpha, 0, 1));
-
-      ctx.strokeStyle = trail.color;
-      let tip = null;
-      for (const segment of trail.segments) {
-        const n = segment.length / 3;
-        if (n < 2) continue;
-        let split = 0;
-        while (split < n && segment[split * 3 + 2] < oldestT + fadeSpan) split += 1;
-        const fadeEnd = clamp(split - 1, 0, n - 1);
-
-        if (fadeEnd > 0) {
-          // Four gradient slices over the fading part: enough for a smooth ramp,
-          // few enough that stroke seams are practically invisible.
-          const pieces = clamp(Math.ceil(fadeEnd / 12), 2, 4);
-          const step = Math.max(1, Math.ceil(fadeEnd / pieces));
-          for (let start = 0; start < fadeEnd; start += step) {
-            const end = Math.min(fadeEnd, start + step);
-            const a0 = clamp(fade * alphaAt(segment[start * 3 + 2]), 0, 1);
-            const a1 = clamp(fade * alphaAt(segment[end * 3 + 2]), 0, 1);
-            const from = this.worldToScreen(segment[start * 3], segment[start * 3 + 1]);
-            const to = this.worldToScreen(segment[end * 3], segment[end * 3 + 1]);
-            const chord = Math.hypot(to.x - from.x, to.y - from.y);
-            if (chord < 0.75) {
-              ctx.globalAlpha = (a0 + a1) / 2;
-            } else {
-              const gradient = ctx.createLinearGradient(from.x, from.y, to.x, to.y);
-              gradient.addColorStop(0, tint(a0));
-              gradient.addColorStop(1, tint(a1));
-              ctx.globalAlpha = 1;
-              ctx.strokeStyle = gradient;
-            }
-            this.traceTrailSlice(ctx, segment, start, end);
+        const entity = this.entities.get(id);
+        if (!entity || entity.showTrail === false) continue;
+        ctx.strokeStyle = trail.color;
+        for (const segment of trail.segments) {
+          const count = segment.length / 3;
+          if (count < 2) continue;
+          ctx.beginPath();
+          const first = this.worldToScreen(segment[0], segment[1]);
+          ctx.moveTo(first.x, first.y);
+          for (let i = 1; i < count; i += 1) {
+            const p = this.worldToScreen(segment[i * 3], segment[i * 3 + 1]);
+            ctx.lineTo(p.x, p.y);
           }
+          ctx.stroke();
         }
-
-        if (fadeEnd < n - 1) {
-          ctx.strokeStyle = trail.color;
-          ctx.globalAlpha = clamp(fade, 0, 1);
-          this.traceTrailSlice(ctx, segment, Math.max(0, fadeEnd), n - 1);
-        }
-        tip = { x: segment[(n - 1) * 3], y: segment[(n - 1) * 3 + 1] };
       }
-
-      if (tip && fade > 0.5) {
-        const p = this.worldToScreen(tip.x, tip.y);
-        ctx.globalAlpha = clamp(fade, 0, 1);
-        ctx.fillStyle = trail.color;
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, selected ? 2.2 : 1.6, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      ctx.globalAlpha = 1;
+      ctx.restore();
     }
 
     prepareConnectorForces() {
@@ -5150,16 +5166,27 @@
     }
 
     renderFilePanel() {
-      const presets = Object.entries(PRESET_INFO).map(([id, info]) => `
-        <button type="button" class="preset-btn" data-action="load-preset" data-preset="${id}">
-          <span><strong>${info.label}</strong><small>${info.note}</small></span>
-          <span class="arrow">→</span>
-        </button>
+      const groups = new Map();
+      for (const [id, info] of Object.entries(PRESET_INFO)) {
+        const group = info.group || '其他';
+        if (!groups.has(group)) groups.set(group, []);
+        groups.get(group).push([id, info]);
+      }
+      const presets = [...groups].map(([group, items]) => `
+        <div class="preset-group">
+          <div class="preset-group-title">${group}<span>${items.length}</span></div>
+          ${items.map(([id, info]) => `
+            <button type="button" class="preset-btn" data-action="load-preset" data-preset="${id}">
+              <span><strong>${info.label}</strong><small>${info.note}</small></span>
+              <span class="arrow">→</span>
+            </button>
+          `).join('')}
+        </div>
       `).join('');
       return `
         ${this.panelHeader('FILE / 07', '文件')}
         <section class="panel-section">
-          <h3 class="section-title">演示预设 <span class="section-count">4 SCENES</span></h3>
+          <h3 class="section-title">演示预设 <span class="section-count">${Object.keys(PRESET_INFO).length} SCENES</span></h3>
           <div class="preset-list">${presets}</div>
           <div class="notice">载入预设会替换当前场景；需要保留时先导出。</div>
         </section>
@@ -5249,8 +5276,7 @@
             <div class="toggle-copy">
               <strong>显示轨迹</strong>
               <small>记录每个物体质心走过的路径，颜色与下方列表一致。</small>
-            </div>
-            <button type="button" class="toggle ${this.state.showTrails ? 'is-on' : ''}"
+            </div>            <button type="button" class="toggle ${this.state.showTrails ? 'is-on' : ''}"
               data-action="toggle-display" data-key="showTrails" aria-pressed="${this.state.showTrails}"></button>
           </div>
           ${bodies.length ? `<div class="chip-row trail-row">${trailChips}</div>` : '<div class="empty-state">场景中没有物体。</div>'}
@@ -5840,7 +5866,7 @@
         <section class="panel-section">
           <h3 class="section-title">运动轨迹</h3>
           <div class="section-copy">
-            「显示」面板里的「运动轨迹」会把每个物体质心的路径画在画布上，颜色与物体列表中的色标一致；点击某个物体名可以只隐藏它的轨迹，「清除轨迹」清空全部记录。轨迹的最旧一段会逐渐淡出，超过缓冲上限后也是平滑消隐而不是突然截断；编辑拖动、重置或切换预设后旧轨迹分段保留，不会连出一条假的直线。
+            「显示」面板里的「运动轨迹」会把每个物体质心的路径画在画布上，颜色与物体列表中的色标一致，线条为固定颜色、不做渐隐；点击某个物体名可以只隐藏它的轨迹，「清除轨迹」立即清空全部记录。编辑拖动、重置或切换预设后旧轨迹分段保留，不会连出一条假的直线。
           </div>
         </section>
         <section class="panel-section">
